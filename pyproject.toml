@@ -37,6 +37,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
 eval = [
     "scipy>=1.12.0",
     "unstructured>=0.14.0",

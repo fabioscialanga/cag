@@ -270,6 +270,7 @@ pip install -e .
 Optional dependency groups:
 
 ```bash
+pip install -e ".[dev]"         # pytest and local dev tooling
 pip install -e ".[eval]"        # benchmark evaluation
 pip install -e ".[lightrag]"    # LightRAG baseline comparison
 pip install -e ".[pinecone]"    # Pinecone vector store
@@ -309,6 +310,7 @@ cag ingest --data-dir ./data/raw
 ### 5. Run tests
 
 ```bash
+pip install -e ".[dev,eval]"
 pytest
 ```
 

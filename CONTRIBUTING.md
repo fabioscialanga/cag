@@ -32,7 +32,7 @@ source .venv/bin/activate
 Then:
 
 ```bash
-pip install -r requirements.txt
+pip install -e ".[dev,eval]"
 ```
 
 Frontend:
