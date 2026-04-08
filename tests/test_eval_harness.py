@@ -521,6 +521,18 @@ def test_compare_cli_supports_multi_run_directories(tmp_path: Path):
     assert payload["statistical_test"]["n_pairs"] == 1
 
 
+def test_cag_cli_module_entrypoint_shows_usage():
+    completed = subprocess.run(
+        [sys.executable, "-m", "cag.cli"],
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    combined_output = f"{completed.stdout}\n{completed.stderr}"
+    assert "usage:" in combined_output.lower()
+
+
 def test_multi_run_aggregation():
     from cag.eval.models import MetricStats
     from cag.eval.run import _compute_multi_run_stats
