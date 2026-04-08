@@ -1,0 +1,347 @@
+# CAG Architecture
+
+## What CAG Is
+
+CAG stands for **Cognitive Augmented Generation**. It is a retrieval system that does not just fetch chunks and hand them to a language model. It decides how to search, how to reason about the evidence it found, and -- when the evidence is too weak -- whether to answer at all.
+
+The system is organized as a directed graph where each node performs a distinct cognitive function: classifying the question, retrieving documents, evaluating evidence quality, generating a grounded answer, and validating that answer before it reaches the user. Routing between nodes is conditional: the graph can skip generation entirely when evidence is insufficient, or it can retry generation when the first attempt looks unreliable.
+
+The runtime implementation lives under:
+
+- `src/cag/graph/` -- graph assembly, node functions, conditional routing, shared state
+- `src/cag/agents/` -- retrieval agent (evidence ranking) and reasoning agent (answer generation)
+- `src/cag/eval/` -- benchmark harness for comparing CAG against RAG baselines
+
+
+## Why Cognitive?
+
+CAG uses the word "cognitive" in the specific sense of **meta-cognition**: the system evaluates its own ability to produce a reliable answer at multiple points during processing. This is not a cosmetic label. Each node in the graph serves a distinct meta-cognitive function:
+
+| Node | Meta-cognitive role | What it evaluates |
+|---|---|---|
+| **ENTRY** | Context comprehension | What kind of question is this? What scope does it have? What retrieval strategy fits best? |
+| **RETRIEVE + REFINE** | Self-assessment of evidence quality | Is what I found good enough to answer? Are there gaps? Should I even proceed? |
+| **REASON** | Conditioned generation | Given the evidence I judged sufficient, what answer can I safely construct? |
+| **VALIDATE** | Meta-validation | Did I produce a grounded answer? Is the hallucination risk acceptable? Should I retry or escalate? |
+
+The key insight is that the system can **refuse to answer**. When evidence quality is below threshold, CAG either retries with adjusted reasoning or escalates to a human rather than fabricating a plausible-sounding response. This awareness of its own limits -- and the architectural discipline to act on that awareness -- is what separates CAG from a pipeline that always produces output regardless of input quality.
+
+This is different from "RAG with extra steps." In a standard RAG pipeline, retrieval is a preprocessing stage and the model always generates. In CAG, the orchestration layer itself is where the reasoning happens: classification informs retrieval strategy, evidence evaluation gates generation, and validation gates delivery.
+
+
+## Core Difference from RAG
+
+Standard RAG is usually:
+
+```
+retrieve -> generate
+```
+
+CAG replaces this with a control loop:
+
+```
+ENTRY -> RETRIEVE -> REFINE -> REASON -> VALIDATE -> EXIT
+```
+
+This is worth examining in more detail, because advanced RAG implementations exist that add reranking, guardrails, and output filtering. The distinction is not about feature count. It is about **where the intelligence lives**.
+
+In standard RAG -- even advanced variants -- retrieval is a preprocessing step. The query comes in, chunks come out, and the language model generates. Post-hoc filters may reject unsafe outputs, but the core flow is linear: always retrieve, always generate, maybe block.
+
+In CAG, the orchestration is not a thin wrapper around vector search. It is part of the system's reasoning:
+
+1. **Classification before retrieval.** The ENTRY node inspects the query and decides what type it is (GENERAL, PROCEDURAL, DIAGNOSTIC, CONFIGURATION) and what scope it has (domain, personal, consultative). This classification directly controls the retrieval strategy, the number of chunks fetched, and how query variants are constructed.
+
+2. **Evidence quality gates generation.** After retrieval and refinement, the system explicitly asks: is this evidence good enough to answer? If not, it skips REASON entirely and goes straight to VALIDATE with no answer, which triggers escalation. Generation is conditioned on evidence quality, not performed unconditionally.
+
+3. **Retry with awareness.** When REASON produces an answer but VALIDATE detects high hallucination risk, the system can send the query back through REASON (up to a configured maximum of 2 retries). This is not blind repetition -- each retry increments a counter that eventually forces escalation.
+
+4. **Structured escalation over fabrication.** When the system cannot produce a safe answer, it says so explicitly and tells the user what went wrong. It does not lower its thresholds and hope for the best.
+
+
+## Graph Flow
+
+The graph is assembled in `src/cag/graph/graph.py` using LangGraph's `StateGraph`. The shared state is defined in `src/cag/graph/state.py` as a `TypedDict` with fields for query metadata, chunks, scores, answer, citations, and control flags.
+
+### ASCII Diagram
+
+```
+START
+  |
+  v
+ ENTRY -- classify query type, scope, strategy
+  |
+  v
+ RETRIEVE -- fetch chunks with strategy-aware k and query variants
+  |
+  v
+ REFINE -- rank chunks, compute relevance, identify gaps
+  |
+  +-- reasonable evidence --> REASON
+  |                            |
+  |                            v
+  |                          VALIDATE
+  |                            |
+  +-- weak evidence ----> VALIDATE  +-- acceptable --------------> EXIT
+                               |
+                               +-- high hallucination risk,   -> REASON (retry)
+                               |   retries <= max
+                               |
+                               +-- max retries reached or      -> EXIT (escalation)
+                                   fatal quality problem
+```
+
+### Routing Functions
+
+Two conditional edges control the flow:
+
+**`route_after_refine`** (REFINE -> REASON or VALIDATE)
+
+After REFINE scores the evidence, the system checks `_has_reasonable_evidence()`. If evidence is reasonable, the graph proceeds to REASON. If not, it skips REASON entirely and goes directly to VALIDATE with an empty answer -- which will trigger escalation.
+
+**`route_after_validate`** (VALIDATE -> EXIT or REASON)
+
+After VALIDATE checks the answer, two outcomes are possible:
+- If `should_escalate` is `True`, the graph goes to EXIT with an escalation message.
+- If hallucination risk exceeds the threshold (0.3) and the retry count has not exceeded the maximum (2), the graph routes back to REASON for another attempt.
+- Otherwise, the graph goes to EXIT with the generated answer.
+
+### Evidence Quality Criteria
+
+`_has_reasonable_evidence()` returns `True` if any of these conditions hold:
+
+| Condition | Rationale |
+|---|---|
+| Top chunk score >= `relevance_threshold` (0.7) | At least one chunk is strongly relevant |
+| Top chunk score >= 0.55 AND query type is PROCEDURAL or DIAGNOSTIC | Troubleshooting and how-to queries tolerate slightly weaker individual chunks because they often require assembling multiple partial sources |
+| At least 2 chunks with score >= 0.55 AND overall relevance >= 0.55 | Multiple moderately relevant chunks provide adequate coverage even without a single strong hit |
+
+If none of these hold, evidence is considered weak and REASON is skipped.
+
+### VALIDATE Escalation Conditions
+
+VALIDATE checks five escalation conditions, evaluated in order. If any is true, `should_escalate` is set to `True` and an error message is attached:
+
+1. **No answer AND no reasonable evidence.** REASON was skipped (weak evidence path) and no answer exists. The system cannot fabricate something from nothing.
+
+2. **Insufficient answer text AND (no reasonable evidence OR low confidence OR high hallucination risk).** REASON ran but its own output signals that the documentation was inadequate. This is detected by pattern matching against signals like "documentation is insufficient," "not documented," "cannot determine," and similar phrases.
+
+3. **Low relevance AND no reasonable evidence.** Overall relevance is below threshold and the per-chunk check also fails. The evidence base is weak from every angle.
+
+4. **High hallucination risk AND max retries reached.** The system tried to generate multiple times but each attempt produced high hallucination risk. Further retries are unlikely to help.
+
+5. **Low confidence AND max retries reached.** Confidence remains below threshold after all retry attempts are exhausted.
+
+### Retry Condition
+
+The only condition that triggers a retry (as opposed to an escalation or normal exit) is:
+
+- `hallucination_risk > hallucination_threshold` (0.3 by default)
+- `reason_retries <= max_reason_retries` (2 by default)
+
+When this condition holds, the graph routes back to REASON. The retry counter increments on each REASON invocation. Once the counter exceeds the maximum, any subsequent high hallucination risk triggers escalation instead.
+
+
+## Query Classification
+
+### Query Types
+
+The ENTRY node classifies each query into one of four types. This classification controls retrieval strategy, chunk count, and query variant construction.
+
+| Type | Retrieval Strategy | Effective k | Typical Questions |
+|---|---|---|---|
+| **GENERAL** | `semantic` | default (10) | Factual lookups, definitions, "what is" questions |
+| **PROCEDURAL** | `hierarchical` | default + 4 (14) | Step-by-step guides, "how do I" questions |
+| **DIAGNOSTIC** | `multi_evidence` | default + 4 (14) | Troubleshooting, error analysis, "why does" questions |
+| **CONFIGURATION** | `semantic` | default (10) | Settings, parameters, prerequisites, "which fields" questions |
+
+Classification is pattern-based. The query string is matched against keyword lists defined in `_infer_query_type()`. Diagnostic patterns include error-specific terms ("error", "404", "not working", "rejected"). Procedural patterns include action phrases ("how do i", "step by step", "how to"). Configuration patterns include setup terms ("configure", "settings", "prerequisite"). General patterns include definitional phrases ("what is", "how does"). The fallback is GENERAL.
+
+### Question Scopes
+
+In addition to query type, ENTRY classifies the question's scope:
+
+| Scope | Meaning | Retrieval Impact |
+|---|---|---|
+| **domain** | Document-specific questions about content | Normal retrieval flow |
+| **personal** | Conversational questions ("how are you", "who are you") | Not a document query; the system still processes normally but may find no relevant chunks |
+| **consultative** | Advisory questions ("what should I", "recommend") | Forces `multi_evidence` retrieval strategy regardless of query type |
+
+Scope is determined by `_classify_question_scope()`, which checks for personal markers, consultative markers, and domain markers in the query. If personal markers are found without domain markers, the scope is `personal`. If consultative markers are found, the scope is `consultative`. Otherwise, the default is `domain`.
+
+### Query Variants
+
+RETRIEVE does not use a single query string. It constructs up to 3 query variants via `_build_query_variants()`:
+
+1. **Original query** -- the user's exact input, stripped of whitespace.
+2. **Keyword-focused variant** -- the query is normalized (lowercased, punctuation replaced with spaces), stopwords are removed, and the top 8 keywords are joined. Common action words are rewritten to their noun forms (e.g., "configure" becomes "configuration", "solve" becomes "resolution").
+3. **Compact variant** (PROCEDURAL, DIAGNOSTIC, CONFIGURATION only) -- question prefixes like "how do I", "how can I", "why" are stripped, leaving only the substantive terms.
+
+Each variant is run against the vector store independently. The first variant uses the full `per_query_k`; subsequent variants use half that value (minimum 4). Results are deduplicated by (filename, chunk_index, content prefix) and sorted by keyword overlap with the original query.
+
+
+## Worked Examples
+
+### Example 1: Success Path
+
+**Query:** "How do I configure the notification module?"
+
+```
+ENTRY
+  query_type  = CONFIGURATION  (matches "configur" pattern)
+  scope       = domain         (no personal or consultative markers)
+  strategy    = semantic       (default for CONFIGURATION)
+
+RETRIEVE
+  variants    = ["How do I configure the notification module?",
+                 "notification module configuration",
+                 "notification module"]
+  k           = 10 per variant (semantic strategy, default k)
+  result      = 10 deduplicated chunks about notification configuration
+
+REFINE
+  top chunk score  = 0.88  (strong match on notification module configuration)
+  gaps             = []    (no missing information detected)
+  relevance_score  = 0.82  (overall evidence quality is high)
+  routing          -> REASON  (top score 0.88 >= threshold 0.7)
+
+REASON
+  confidence         = 0.85
+  hallucination_risk = 0.10
+  citations          = 3 chunks cited
+  answer             = structured response with prerequisites, required fields,
+                       and configuration steps, grounded in the retrieved chunks
+
+VALIDATE
+  top score >= threshold          -> reasonable evidence: YES
+  answer is substantive           -> insufficient answer: NO
+  hallucination_risk 0.10 < 0.3   -> within limits
+  confidence 0.85 >= 0.6          -> above threshold
+  should_escalate                 -> FALSE
+  routing                         -> EXIT (normal)
+
+EXIT
+  Delivers the generated answer with 3 citations.
+  Node trace: ENTRY -> RETRIEVE -> REFINE -> REASON(retry=0) -> VALIDATE -> EXIT
+```
+
+### Example 2: Escalation Path
+
+**Query:** "What is the pricing for the enterprise plan?"
+
+```
+ENTRY
+  query_type  = GENERAL        (matches "what is" pattern)
+  scope       = domain
+  strategy    = semantic       (default for GENERAL)
+
+RETRIEVE
+  variants    = ["What is the pricing for the enterprise plan?",
+                 "pricing enterprise plan"]
+  k           = 10 per variant
+  result      = 10 chunks, none about pricing (documentation does not cover this topic)
+
+REFINE
+  top chunk score  = 0.22  (best match is tangential, perhaps mentioning "enterprise" in
+                            an unrelated context)
+  gaps             = ["pricing information", "enterprise plan details"]
+  relevance_score  = 0.18  (overall evidence quality is very low)
+  routing          -> VALIDATE  (top score 0.22 < threshold 0.7;
+                                  no 0.55+ chunks; no moderate-coverage case)
+
+  Note: REASON is skipped entirely. The system refuses to generate from this evidence.
+
+VALIDATE
+  answer is empty                  -> no answer
+  _has_reasonable_evidence()       -> FALSE (top score 0.22, no moderate chunks)
+  Escalation condition 1 triggers  -> should_escalate = TRUE
+  error_message = "The retrieved documentation does not cover this request
+                   reliably. Human review or additional source material is required."
+  routing                          -> EXIT (escalation)
+
+EXIT
+  Delivers escalation message:
+    "Support escalation recommended.
+     The retrieved documentation does not cover this request reliably.
+     Human review or additional source material is required.
+     Please route this question to a human reviewer or provide additional
+     supporting documents."
+  Node trace: ENTRY -> RETRIEVE -> REFINE -> VALIDATE -> EXIT
+```
+
+### Example 3: Retry Path
+
+**Query:** "How do I fix the rejected invoice error?"
+
+```
+ENTRY
+  query_type  = DIAGNOSTIC     (matches "fix" + "rejected" + "error" patterns)
+  scope       = domain
+  strategy    = multi_evidence (DIAGNOSTIC forces this strategy)
+
+RETRIEVE
+  k           = 14 per variant (multi_evidence strategy, default + 4)
+  result      = 14 chunks about invoice errors and rejection handling
+
+REFINE
+  top chunk score  = 0.71
+  relevance_score  = 0.65
+  routing          -> REASON  (top score 0.71 >= threshold 0.7)
+
+REASON (attempt 1)
+  confidence         = 0.55
+  hallucination_risk = 0.45   (high -- the answer strays from the evidence)
+  answer             = partially grounded response
+
+VALIDATE
+  hallucination_risk 0.45 > 0.3   -> above threshold
+  reason_retries = 1 (first attempt)
+  1 <= max_reason_retries (2)     -> retry allowed
+  should_escalate                  -> FALSE (not checked, retry takes priority)
+  routing                          -> REASON (retry)
+
+REASON (attempt 2)
+  confidence         = 0.78
+  hallucination_risk = 0.15   (improved -- the model stays closer to the evidence)
+  answer             = well-grounded response with corrective steps
+
+VALIDATE
+  hallucination_risk 0.15 < 0.3  -> within limits
+  should_escalate                 -> FALSE
+  routing                         -> EXIT (normal)
+
+EXIT
+  Delivers the second answer with citations.
+  Node trace: ENTRY -> RETRIEVE -> REFINE -> REASON(retry=0) -> VALIDATE
+              -> REASON(retry=1) -> VALIDATE -> EXIT
+```
+
+
+## What This Repository Tries to Prove
+
+This repository is not claiming that every possible CAG system is better than every RAG system.
+
+It is making one narrower claim testable:
+
+**For this implementation, orchestration can improve grounded answer quality over a simpler RAG baseline.**
+
+That is why the benchmark harness is a first-class part of the repository. The evaluation framework under `src/cag/eval/` supports running the same question set through both CAG and a standard RAG pipeline, scoring answers on relevance, groundedness, and safety, and producing a structured comparison.
+
+The goal is not to prove a general theorem. It is to provide a reproducible experiment where the hypothesis -- that meta-cognitive orchestration improves answer quality -- can be confirmed or falsified against a concrete baseline.
+
+
+## Preview Scope
+
+**What is already solid:**
+
+- Graph-driven orchestration with conditional routing and retry logic
+- Evaluation harness for comparing CAG against RAG baselines
+- Generic document-oriented positioning (no domain-specific assumptions)
+- React frontend and FastAPI backend for interactive testing
+- Configurable thresholds (relevance, confidence, hallucination, max retries)
+
+**What is still preview-stage:**
+
+- Benchmark size and corpus diversity
+- Prompt stability across different LLM providers
+- Broader community-facing examples and documentation
+- Performance optimization for large document collections

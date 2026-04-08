@@ -1,0 +1,93 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cag"
+version = "0.1.0"
+description = "Cognitive Augmented Generation for grounded document intelligence"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "Fabio Scialanga"},
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "langgraph>=0.2.0",
+    "agno>=1.4.0",
+    "openai>=1.30.0",
+    "langchain-community>=0.2.0",
+    "langchain-text-splitters>=0.2.0",
+    "langchain-openai>=0.1.0",
+    "pypdf>=4.0.0",
+    "pydantic>=2.7.0",
+    "pydantic-settings>=2.2.0",
+    "python-dotenv>=1.0.0",
+    "rich>=13.7.0",
+    "tenacity>=8.3.0",
+    "chromadb>=0.5.0",
+]
+
+[project.optional-dependencies]
+eval = [
+    "scipy>=1.12.0",
+    "unstructured>=0.14.0",
+]
+lightrag = [
+    "scipy>=1.12.0",
+    "unstructured>=0.14.0",
+    "lightrag-hku>=1.4.13",
+]
+pinecone = [
+    "pinecone-client>=3.0.0",
+]
+ui = [
+    "streamlit>=1.35.0",
+]
+api = [
+    "fastapi>=0.95.0",
+    "uvicorn>=0.22.0",
+    "python-multipart>=0.0.6",
+]
+all = [
+    "scipy>=1.12.0",
+    "unstructured>=0.14.0",
+    "lightrag-hku>=1.4.13",
+    "pinecone-client>=3.0.0",
+    "streamlit>=1.35.0",
+    "fastapi>=0.95.0",
+    "uvicorn>=0.22.0",
+    "python-multipart>=0.0.6",
+]
+
+[project.scripts]
+cag = "cag.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/fabioscialanga/cag"
+Documentation = "https://github.com/fabioscialanga/cag#readme"
+Repository = "https://github.com/fabioscialanga/cag"
+Issues = "https://github.com/fabioscialanga/cag/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"cag.eval" = ["benchmark_dataset.jsonl"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+addopts = "-v --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

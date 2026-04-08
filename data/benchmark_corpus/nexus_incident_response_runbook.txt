@@ -1,0 +1,415 @@
+================================================================================
+             NEXUS PLATFORM INCIDENT RESPONSE RUNBOOK
+             Version 2.1 | Last Updated: 2026-03-20
+             Classification: INTERNAL - Engineering & Operations
+             Copyright (c) 2026 Nexus Technologies, Inc.
+================================================================================
+
+TABLE OF CONTENTS
+  1. Severity Classification
+  2. Error Code Reference
+  3. Diagnostic Procedures
+  4. Escalation Procedures
+  5. Post-Incident Review
+
+================================================================================
+1. SEVERITY CLASSIFICATION
+================================================================================
+
+All incidents are classified by severity level. The on-call engineer is
+responsible for initial triage and classification within the first 10 minutes
+of detection.
+
+  Severity    Description                          Response SLA    Notification
+  ----------------------------------------------------------------------------------
+  SEV1        Total system outage. No users can    15 minutes      Page on-call +
+              access any functionality. All core                    escalate to
+              services are down or unreachable.                     engineering
+                                                                    director.
+  ----------------------------------------------------------------------------------
+  SEV2        Major feature degradation. More      1 hour          Page on-call
+              than 50% of users are affected. A
+              critical feature is unavailable or
+              severely impaired (e.g., notifications
+              not delivering, login failures).
+  ----------------------------------------------------------------------------------
+  SEV3        Minor feature degradation. Less      4 hours         Email on-call
+              than 50% of users are affected. A
+              non-critical feature has reduced
+              functionality (e.g., delayed reports,
+              minor UI issues).
+  ----------------------------------------------------------------------------------
+  SEV4        Cosmetic or informational issue.     24 hours        Ticket created
+              No functional impact. Includes
+              documentation errors, minor display
+              glitches, or enhancement requests.
+  ----------------------------------------------------------------------------------
+
+1.1 Severity Decision Tree
+---------------------------
+  Step 1: Are all core services affected?              -> If YES: SEV1
+  Step 2: Are more than 50% of users impacted?         -> If YES: SEV2
+  Step 3: Is a non-critical feature degraded?          -> If YES: SEV3
+  Step 4: Is the issue cosmetic or informational?      -> If YES: SEV4
+
+1.2 Severity Reclassification
+------------------------------
+Incidents may be reclassified during the response process. Any reclassification
+must be logged in the incident timeline with a justification. Upward
+reclassification (e.g., SEV3 to SEV2) triggers the notification procedure for
+the new severity level.
+
+
+================================================================================
+2. ERROR CODE REFERENCE
+================================================================================
+
+The following error codes are returned by Nexus Platform APIs and services.
+Use this reference to identify root causes and apply resolution steps.
+
+2.1 NX-1001: Authentication Timeout
+-------------------------------------
+  Cause:       Expired authentication token or system clock drift exceeding
+               5 minutes between client and server.
+  Symptoms:    API requests return HTTP 401 with error code NX-1001. Users
+               may see "Session expired" messages despite recent login.
+  Resolution:
+    1. Regenerate the authentication token via the admin console or CLI:
+         $ nexus-cli token regenerate --user <email>
+    2. Verify system clock synchronization:
+         $ nexus-cli diagnostics ntp-status
+    3. Sync system clock to NTP if drift is detected:
+         $ sudo ntpdate -u pool.ntp.org
+    4. Confirm token validity by making a test API call.
+
+2.2 NX-1002: Permission Denied
+--------------------------------
+  Cause:       The authenticated user does not have sufficient role privileges
+               for the requested operation.
+  Symptoms:    API requests return HTTP 403 with error code NX-1002.
+  Resolution:
+    1. Verify the user's current role in Workspace Settings > Users.
+    2. Confirm the required role for the operation in the permissions matrix.
+    3. If role elevation is needed, contact a workspace administrator.
+    4. After role changes, the user must log out and log back in for
+       changes to take effect.
+
+2.3 NX-1003: Rate Limit Exceeded
+----------------------------------
+  Cause:       The request count has exceeded the limit for the workspace's
+               subscription tier (Standard: 1,000/hour, Enterprise: 5,000/hour).
+  Symptoms:    API requests return HTTP 429 with error code NX-1003.
+  Resolution:
+    1. Review current request volume in the Usage Dashboard.
+    2. Reduce request frequency or implement request batching.
+    3. If sustained higher throughput is required, upgrade to the
+       Enterprise tier by contacting the account team.
+    4. Check the Retry-After header to determine when requests may resume.
+
+2.4 NX-1004: Webhook Endpoint Unreachable
+-------------------------------------------
+  Cause:       The target webhook server is down or a firewall is blocking
+               inbound connections from Nexus Platform IPs.
+  Symptoms:    Webhook delivery failures in the Integration Dashboard with
+               error code NX-1004. Connection timeouts or TCP reset errors.
+  Resolution:
+    1. Verify the endpoint URL is correct and accessible:
+         $ curl -v https://your-webhook-endpoint.example.com
+    2. Check firewall rules to ensure Nexus Platform IP ranges are allowed:
+         - 203.0.113.0/24
+         - 198.51.100.0/24
+    3. Confirm the endpoint is responding with HTTP 200.
+    4. If the endpoint uses a load balancer, verify health check configuration.
+
+2.5 NX-1005: Webhook Delivery Failure (TLS)
+---------------------------------------------
+  Cause:       TLS certificate on the webhook endpoint has expired or the
+               endpoint uses a self-signed certificate that is not in the
+               Nexus Platform trust store.
+  Symptoms:    Webhook deliveries fail with TLS handshake errors. Error code
+               NX-1005 appears in integration logs.
+  Resolution:
+    1. Check the TLS certificate expiration date:
+         $ openssl s_client -connect your-endpoint:443 -showcerts
+    2. If the certificate has expired, renew it via your certificate authority.
+    3. If using a self-signed certificate, add the issuing CA to the Nexus
+       Platform trust store under Settings > Security > Certificate Trust Store.
+    4. After updating certificates, trigger a test webhook delivery to confirm.
+
+2.6 NX-1006: Notification Queue Overflow
+------------------------------------------
+  Cause:       The SMTP server has been unresponsive for more than 10 minutes,
+               causing the notification queue to exceed its capacity.
+  Symptoms:    Email notifications are delayed or not delivered. The admin
+               console shows a queue depth warning.
+  Resolution:
+    1. Verify SMTP server connectivity:
+         $ nexus-cli ping --target=smtp.nexus-platform.io --port=587
+    2. If the built-in SMTP relay is used, check the Service Health Dashboard.
+    3. Restart the notification service via the admin console:
+         Navigate to Settings > Services > Notification Service > Restart
+    4. Monitor the queue depth for 15 minutes after restart to confirm recovery.
+    5. If the issue persists, check SMTP credentials and TLS configuration.
+
+2.7 NX-1007: Data Export Timeout
+----------------------------------
+  Cause:       The requested data export exceeds the configured batch limit
+               or the date range is too large for a single export operation.
+  Symptoms:    Export jobs fail with HTTP 504. Error code NX-1007 appears
+               in the export logs.
+  Resolution:
+    1. Reduce the date range for the export and retry.
+    2. Use incremental export mode for large datasets:
+         $ nexus-cli export --mode=incremental --since=2026-03-01
+    3. If necessary, increase the request timeout in Advanced Settings
+       (configurable from 5 to 120 seconds).
+    4. For exports exceeding 500 records, use the paginated export API:
+         GET /api/v1/export?from=<date>&to=<date>&limit=500&cursor=<token>
+
+2.8 NX-1008: Integration Sync Failure
+---------------------------------------
+  Cause:       A third-party API returned an unexpected HTTP response code
+               during a scheduled sync operation.
+  Symptoms:    Integration status shows "Sync Failed" in the Integration
+               Dashboard. Error code NX-1008 is logged with the upstream
+               response code.
+  Resolution:
+    1. Open the Integration Health Dashboard and locate the failing integration.
+    2. Verify the third-party API credentials are still valid.
+    3. Review the audit logs for the specific response code returned:
+         $ nexus-cli logs --severity=ERROR --filter=NX-1008 --last=24h
+    4. Check the third-party service's status page for known outages.
+    5. Re-authenticate the integration if credentials have been rotated.
+
+
+================================================================================
+3. DIAGNOSTIC PROCEDURES
+================================================================================
+
+Use the following procedures to gather diagnostic information during incident
+response.
+
+3.1 System Health Check
+------------------------
+Perform a health check to verify core service availability:
+
+  $ curl -s https://api.nexus-platform.io/api/v1/health
+
+Expected response (HTTP 200):
+  {
+    "status": "healthy",
+    "uptime": "14d 6h 23m",
+    "version": "3.2.1",
+    "components": {
+      "database": "healthy",
+      "cache": "healthy",
+      "notification_service": "healthy",
+      "webhook_service": "healthy"
+    }
+  }
+
+If any component reports "degraded" or "unhealthy", proceed to the relevant
+error code section for troubleshooting.
+
+3.2 Log Collection
+-------------------
+Collect logs for analysis using the Nexus CLI:
+
+  $ nexus-cli logs --severity=WARN --last=24h --format=json
+
+Output is written to stdout in JSON format. Redirect to a file for analysis:
+
+  $ nexus-cli logs --severity=WARN --last=24h --format=json > incident_logs.json
+
+Available severity filters: DEBUG, INFO, WARN, ERROR
+
+Time range options: --last=1h, --last=6h, --last=12h, --last=24h, --last=7d
+
+3.3 Connectivity Test
+----------------------
+Test connectivity to external services:
+
+  $ nexus-cli ping --target=smtp.nexus-platform.io --port=587
+
+Expected output:
+  Pinging smtp.nexus-platform.io:587...
+  Connection established in 42ms
+  TLS handshake completed (TLS 1.3)
+  Status: OK
+
+Common failure modes:
+  - "Connection refused": Target service is down or port is blocked.
+  - "Connection timed out": Network issue or firewall blocking traffic.
+  - "TLS handshake failed": Certificate or protocol mismatch.
+
+3.4 Database Check
+-------------------
+Verify database health and performance:
+
+  $ nexus-cli db status
+
+Expected output:
+  Connection count:    23 / 100
+  Avg query latency:   4ms
+  Replication lag:     0.2s
+  Disk usage:          34%
+  Status:              OK
+
+Warning thresholds:
+  - Connection count > 80% of maximum
+  - Query latency > 100ms average
+  - Replication lag > 5 seconds
+  - Disk usage > 85%
+
+
+================================================================================
+4. ESCALATION PROCEDURES
+================================================================================
+
+4.1 When to Escalate
+---------------------
+Escalation is mandatory under the following conditions:
+
+  Severity    Escalation Trigger
+  -----------------------------------------------------------
+  SEV1        Always escalate immediately upon confirmation.
+  SEV2        Escalate if unresolved within 2 hours of response start.
+  SEV3        Escalate if unresolved within 8 hours of response start.
+  SEV4        No escalation required. Handle through normal workflow.
+
+4.2 Required Information for Escalation
+-----------------------------------------
+When escalating an incident, the following information must be provided:
+
+  1. Incident ID (auto-generated, format: INC-YYYYMMDD-NNNN)
+  2. Severity level (SEV1-SEV4)
+  3. Affected features or services (list all impacted components)
+  4. Timeline of events (detection, response start, actions taken)
+  5. Current status (investigating, mitigating, resolved)
+
+Prepare this information using the incident template:
+
+  Incident ID:      INC-______________
+  Severity:         SEV__
+  Detected at:      ____-__-__T__:__:__Z
+  Affected features:
+    - _______________
+    - _______________
+  Timeline:
+    - ____-__-__T__:__:__Z  [Detection]  _______________
+    - ____-__-__T__:__:__Z  [Action]     _______________
+  Current status:   _______________
+
+4.3 Escalation Contacts
+------------------------
+  Severity    Contact                                Channel
+  -----------------------------------------------------------------
+  SEV1-2      engineering-oncall@nexus-platform.io   PagerDuty + Email
+  SEV3-4      support@nexus-platform.io              Email + Ticketing
+
+For SEV1 incidents, also notify:
+  - Engineering Director (via PagerDuty executive escalation)
+  - VP of Engineering (via PagerDuty executive escalation)
+  - Customer Success team (for external communication)
+
+4.4 Post-Escalation Actions
+-----------------------------
+After escalation has been initiated:
+
+  1. Create an incident channel in Slack using the naming convention:
+       #inc-YYYYMMDD-short-description
+     Example: #inc-20260320-smtp-outage
+
+  2. Page relevant team leads based on the affected service area:
+       - Platform team: infrastructure, database, API gateway
+       - Notification team: SMTP, delivery queues, rate limiting
+       - Integration team: webhooks, third-party APIs, sync services
+
+  3. Post initial status to the incident channel with all known information.
+
+  4. Provide updates every 30 minutes for SEV1, every 1 hour for SEV2.
+
+  5. Once resolved, post a summary and close the incident channel within
+     72 hours.
+
+
+================================================================================
+5. POST-INCIDENT REVIEW
+================================================================================
+
+All SEV1 and SEV2 incidents require a formal post-incident review. SEV3
+incidents require a review at the discretion of the engineering manager.
+
+5.1 Incident Timeline Template
+--------------------------------
+Document the following milestones for every incident:
+
+  Milestone              Description                          Format
+  -----------------------------------------------------------------------
+  Detection time         When the incident was first detected  ISO 8601
+  Response start         When the on-call engineer began       ISO 8601
+                         actively working on the incident
+  Mitigation time        When user impact was stopped or       ISO 8601
+                         significantly reduced
+  Resolution time        When the root cause was fully         ISO 8601
+                         addressed and systems returned to
+                         normal operation
+
+Calculate key metrics:
+  Time to detect (TTD)   = Response start - Detection time
+  Time to respond (TTR)  = Mitigation time - Response start
+  Time to resolve (TTRe) = Resolution time - Detection time
+
+5.2 Root Cause Categories
+---------------------------
+Classify the root cause into one of the following categories:
+
+  Category                      Description
+  -----------------------------------------------------------------------
+  Configuration error           Misconfigured setting, incorrect parameter,
+                                or unintended change to system configuration.
+  Infrastructure failure        Hardware malfunction, cloud provider outage,
+                                network partition, or resource exhaustion.
+  Third-party dependency        External service outage, API deprecation,
+                                or breaking change in upstream dependency.
+  Code defect                   Bug in application code deployed to production,
+                                logic error, or unhandled edge case.
+  Capacity issue                System exceeded design limits due to unexpected
+                                traffic spike, data volume growth, or resource
+                                contention.
+
+5.3 Post-Mortem Requirements (SEV1-2)
+---------------------------------------
+For SEV1 and SEV2 incidents, the following are mandatory:
+
+  - Blameless post-mortem meeting held within 48 hours of resolution.
+  - Written post-mortem document published to the engineering wiki.
+  - Action items assigned with clear owners and deadlines.
+  - Review shared with engineering leadership and customer success.
+
+Post-mortem document structure:
+  1. Executive summary (1-2 paragraphs)
+  2. Incident timeline
+  3. Root cause analysis
+  4. Impact assessment (users affected, duration, revenue impact)
+  5. What went well
+  6. What could be improved
+  7. Action items (owner, deadline, status)
+
+Action item tracking:
+  - Each action item must have a single owner.
+  - Deadlines must be within 30 days for high-priority items.
+  - Progress is reviewed in the weekly engineering stand-up.
+  - Completed items are marked as resolved in the tracking system.
+
+5.4 Process Improvement
+-------------------------
+Trends across multiple post-mortems should be reviewed quarterly. The
+engineering director is responsible for identifying recurring patterns and
+proposing systemic improvements.
+
+================================================================================
+END OF DOCUMENT
+Nexus Platform Incident Response Runbook v2.1
+For questions about this runbook, contact: sre@nexus-platform.io
+================================================================================

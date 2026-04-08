@@ -1,0 +1,6 @@
+* text=auto
+*.py linguist-language=Python
+*.js linguist-language=JavaScript
+LICENSE text
+NOTICE text
+.env export-ignore

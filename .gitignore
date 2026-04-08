@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+ENV/
+env/
+
+# Byte-compiled / optimized / DLL files
+*.pyc
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Logs
+logs/
+*.log
+.pytest_cache/
+
+# IDEs
+.vscode/
+.idea/
+.claude/
+
+# Data
+data/chroma_db/
+data/raw/*.pdf
+data/raw/*.txt
+data/raw/*.md
+!data/benchmark_corpus/
+artifacts/
+
+# Node
+node_modules/
+frontend/node_modules/
+
+# dotenv
+.env
+.env.local

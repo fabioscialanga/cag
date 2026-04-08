@@ -1,0 +1,287 @@
+================================================================================
+                    NEXUS TECHNOLOGIES INC.
+                    EMPLOYEE HANDBOOK
+                    Effective: January 2025
+================================================================================
+
+Table of Contents
+-----------------
+  1. Company Overview
+  2. Onboarding Procedures
+  3. Leave Policy
+  4. Benefits
+  5. Code of Conduct
+
+================================================================================
+1. COMPANY OVERVIEW
+================================================================================
+
+Nexus Technologies Inc. is a technology company focused on real-time
+communication and notification infrastructure. This handbook outlines the
+policies, benefits, and expectations for all Nexus employees.
+
+  - Company Name:     Nexus Technologies Inc.
+  - Founded:          2018
+  - Headquarters:     Portland, Oregon
+  - Satellite Office: Austin, Texas
+  - Employees:        350+ (as of 2025)
+
+Mission Statement
+-----------------
+"Building infrastructure that helps teams respond faster and smarter."
+
+Our mission drives every product decision and engineering effort at Nexus.
+We believe that timely, reliable communication is foundational to effective
+teamwork, and our platform is designed to make that possible at scale.
+
+Our Values
+----------
+  - Customer Obsession: Every feature starts with a customer problem.
+  - Ownership: We take responsibility for outcomes, not just tasks.
+  - Transparency: We default to open communication across teams.
+  - Continuous Improvement: We measure, learn, and iterate.
+
+================================================================================
+2. ONBOARDING PROCEDURES
+================================================================================
+
+Welcome to Nexus! This section outlines what you can expect during your first
+30 days. Your hiring manager and assigned buddy will help guide you through
+each step.
+
+Required Documents (Due Before or On Day 1)
+--------------------------------------------
+Before you can begin working, the following documents must be submitted to
+Human Resources:
+
+  - Signed Non-Disclosure Agreement (NDA)
+  - Completed I-9 Employment Eligibility Verification
+  - Emergency Contact Form
+  - Direct Deposit Information
+
+Failure to submit these documents within your first three business days may
+result in a delay of system access and payroll enrollment.
+
+Day 1: Orientation
+------------------
+  - Collect equipment from IT (laptop, badge, security key).
+  - Meet your hiring manager for a welcome conversation and team overview.
+  - Attend the company-wide orientation session at 10:00 AM Pacific.
+  - Review this handbook and submit signed acknowledgment form.
+
+Days 2-3: Compliance and Access
+-------------------------------
+  - Complete all compliance training modules:
+      - Security Awareness Training
+      - Data Handling and Privacy Training
+      - Code of Conduct Review
+  - Request system access via the AccessHub portal (accesshub.nexus-platform.io).
+  - Standard access includes email, chat, wiki, and issue tracker.
+
+Day 5: Integration
+------------------
+  - Your manager will assign an onboarding buddy from your team.
+  - Schedule and hold your first 1:1 meeting with your manager.
+  - Set up your local development environment using the team wiki guide.
+  - Clone relevant repositories and verify build processes work end-to-end.
+
+Day 10: Deeper Access
+---------------------
+  - Observe your first team retrospective meeting.
+  - Access to production systems is granted after a security review conducted
+    by the Platform Engineering team. Your manager must submit the request,
+    and approval typically takes 1-2 business days.
+  - Review the incident response runbook for your team.
+
+Day 30: Onboarding Review
+-------------------------
+  - Conduct a formal onboarding review with your manager.
+  - Complete the onboarding feedback survey (sent by HR via email).
+  - Confirm that all system access requests have been fulfilled and are
+    functioning correctly.
+  - Discuss initial goals and expectations for the next quarter.
+
+================================================================================
+3. LEAVE POLICY
+================================================================================
+
+Nexus offers competitive leave benefits to support work-life balance. All leave
+policies apply to full-time employees. Part-time employees receive pro-rated
+benefits.
+
+Paid Time Off (PTO)
+--------------------
+PTO is accrued monthly and can be used for vacation, personal time, or any
+non-medical absence.
+
+  Years of Service       Annual PTO Days
+  --------------------   ----------------
+  1 - 3 years            20 days
+  4 - 7 years            25 days
+  8+ years               30 days
+
+  - Accrual: Monthly (1/12 of annual allotment credited each pay period).
+  - Rollover: Unused days roll over up to a maximum of 5 days per year.
+  - Rollover days must be used by March 31 of the following year.
+
+Sick Leave
+----------
+  - Allowance: 10 days per year.
+  - Rollover: No rollover. Unused sick days are forfeited at year-end.
+  - Documentation: No doctor's note required for absences of fewer than 3
+    consecutive days. For absences of 3 or more consecutive days, a medical
+    certification may be requested by HR.
+
+Parental Leave
+--------------
+  - Primary Caregiver: 16 weeks, fully paid.
+  - Secondary Caregiver: 6 weeks, fully paid.
+  - Eligibility: Available to all full-time employees after 6 months of
+    continuous employment.
+  - Notice: Employees should notify HR and their manager at least 30 days
+    before the expected start date when reasonably possible.
+
+Bereavement Leave
+-----------------
+  - Immediate Family (spouse, child, parent, sibling): 5 days.
+  - Extended Family (grandparent, grandchild, in-law): 3 days.
+  - Additional unpaid leave may be arranged by speaking with HR.
+
+Leave Request and Approval
+---------------------------
+  - All PTO requests are submitted through the HR portal (hr.nexus-platform.io).
+  - Requests for 1-2 consecutive days are auto-approved if submitted at least
+    48 hours in advance, subject to team capacity constraints.
+  - Requests for 3 or more consecutive days require manager approval.
+  - Manager approval should be received within 3 business days of the request.
+  - In cases of emergency or unplanned absence, notify your manager and HR
+    as soon as practicable.
+
+================================================================================
+4. BENEFITS
+================================================================================
+
+Nexus provides a comprehensive benefits package designed to support employees'
+health, financial security, and professional growth.
+
+Health Insurance
+----------------
+Two health plan options are available through Blue Cross Blue Shield:
+
+  Plan          Employee        Deductible     Coinsurance
+  ----------    ------------    ----------     -----------
+  Basic         $250/month      $1,500         80/20
+  Premium       $450/month      $500           90/10
+
+  - Both plans cover preventive care at 100% with no deductible.
+  - Open enrollment occurs annually in November.
+  - Changes outside of open enrollment require a qualifying life event.
+
+Dental and Vision
+-----------------
+  - Dental and vision coverage is included in both health plans at no
+    additional cost to the employee.
+  - Dental covers two cleanings per year, basic restorative procedures,
+    and orthodontia (50% co-pay, $2,000 lifetime maximum).
+  - Vision covers an annual eye exam and one pair of frames or contacts
+    per year.
+
+401(k) Retirement Plan
+----------------------
+  - Company Match: Nexus matches up to 4% of your salary.
+  - Vesting Schedule: 25% per year of service (fully vested at 4 years).
+  - Investment Options: A range of index funds and target-date funds are
+    available through our plan administrator.
+  - Enrollment: Employees may enroll at any time after their start date.
+
+Professional Development
+------------------------
+  - Annual Budget: $2,000 per employee for conferences, courses, and
+    certifications.
+  - Pre-Approval: Required from your manager before incurring expenses.
+  - Reimbursement: Submit receipts through the expense portal within 30 days.
+  - Internal learning resources and lunch-and-learn sessions are available
+    year-round at no cost.
+
+Remote Work
+-----------
+  - Up to 3 days per week with manager approval.
+  - Remote employees must be available during core hours: 10:00 AM - 3:00 PM
+    Pacific Time.
+  - A stable internet connection (minimum 25 Mbps) is required.
+  - Remote work arrangements are reviewed quarterly.
+
+Equipment
+---------
+  - Company Laptop: Refreshed every 3 years. Standard configuration includes
+    16 GB RAM, 512 GB SSD, and a current-generation processor.
+  - External Monitor: Provided upon request through the IT service desk.
+  - Peripherals (keyboard, mouse, headset): Available upon request.
+  - All company equipment must be returned upon termination of employment
+    (see Code of Conduct, Section 5).
+
+================================================================================
+5. CODE OF CONDUCT
+================================================================================
+
+All Nexus employees are expected to act with integrity and professionalism.
+The following policies are mandatory and apply to all employees, contractors,
+and temporary workers.
+
+Data Handling
+-------------
+  - Customer data must never leave Nexus-controlled systems.
+  - Downloading customer data to personal devices is strictly prohibited.
+  - Access to customer data is logged and audited on a regular basis.
+  - Violations of data handling policies may result in immediate termination
+    and legal action.
+
+Equipment Return
+----------------
+  - All company equipment (laptop, badge, security key, monitor, peripherals)
+    must be returned within 5 business days of termination or separation.
+  - Equipment should be returned to IT at either the Portland or Austin office,
+    or shipped via the pre-paid label provided by HR.
+  - Failure to return equipment may result in the cost being deducted from
+    the final paycheck, to the extent permitted by law.
+
+Remote Work Security
+--------------------
+  - A secure, password-protected Wi-Fi network is required when working
+    remotely.
+  - The company VPN must be active whenever accessing internal systems,
+    including email, chat, wiki, and production environments.
+  - Employees must not use public Wi-Fi (coffee shops, airports, etc.) to
+    access Nexus systems without an active VPN connection.
+  - Multi-factor authentication (MFA) is required on all company accounts.
+
+Conflict of Interest
+--------------------
+  - Employees must disclose any potential conflict of interest in writing to
+    HR within 10 business days of becoming aware of the conflict.
+  - Examples include outside employment, financial interests in competitors,
+    and personal relationships with vendors or clients.
+  - Failure to disclose a conflict of interest may result in disciplinary
+    action up to and including termination.
+
+Reporting Violations
+--------------------
+  - Nexus is committed to a culture of accountability and transparency.
+  - If you witness or suspect a violation of company policy, you are encouraged
+    to report it through any of the following channels:
+      - Ethics Hotline: 1-800-NEXUS-ETH (available 24/7, anonymous reporting)
+      - Email: ethics@nexus-platform.io
+      - Direct report to your manager or any member of the HR team
+  - Nexus maintains a strict non-retaliation policy. No employee will face
+    adverse action for reporting a concern in good faith.
+
+================================================================================
+This handbook is a living document and may be updated from time to time.
+Employees will be notified of material changes via company email and the
+internal wiki. The most current version is always available at
+wiki.nexus-platform.io/handbook.
+
+Last updated: January 2025
+Document owner: Human Resources Department
+Contact: hr@nexus-platform.io
+================================================================================

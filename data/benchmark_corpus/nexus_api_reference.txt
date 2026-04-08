@@ -1,0 +1,424 @@
+================================================================================
+                    NEXUS PLATFORM API REFERENCE
+                    Version 1.0
+                    Last Updated: January 2025
+================================================================================
+
+Table of Contents
+-----------------
+  1. Authentication
+  2. Endpoints
+  3. Error Responses
+  4. Pagination
+  5. Webhook Event Types
+
+================================================================================
+1. AUTHENTICATION
+================================================================================
+
+All API requests require authentication via an API key or bearer token. This
+section describes how to obtain, use, and manage credentials.
+
+API Keys
+--------
+API keys are generated in the Nexus Platform dashboard:
+
+  - Navigation: Settings > Integrations > API Keys
+  - Click "Generate New Key" and assign a name and scope.
+  - The full key is displayed only once. Store it securely.
+
+Key Format
+----------
+  - Prefix:  nx_live_
+  - Body:    32 alphanumeric characters
+  - Example: nx_live_a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6
+
+  Note: Test environment keys use the prefix nx_test_ and follow the same
+  format. Test keys do not incur charges and send notifications to a sandbox.
+
+Key Expiry
+----------
+  - Default expiry:  90 days from creation.
+  - Enterprise plan: Configurable up to 365 days.
+  - Expired keys return a 401 error. Generate a new key to restore access.
+  - A warning email is sent 14 days and 7 days before expiry.
+
+Refreshing Tokens
+-----------------
+Use the refresh endpoint to obtain a new access token without regenerating
+your API key:
+
+  POST /api/v1/auth/refresh
+
+  Request Body:
+  {
+    "refresh_token": "nxrt_abc123def456ghi789jkl012mno345pqr678"
+  }
+
+  Response (200 OK):
+  {
+    "access_token": "nxat_stu901vwx234yzA567BCD890EFG123",
+    "expires_in": 3600,
+    "token_type": "Bearer"
+  }
+
+Scopes
+------
+Each API key is assigned one or more scopes that determine permitted actions:
+
+  Scope       Description
+  --------    ----------------------------------------------------------
+  read        Read-only access to resources (GET requests only).
+  write       Create and modify resources (POST, PUT, PATCH, DELETE).
+  admin       Full access including key management and user administration.
+
+  - Default scope for new keys: read + write.
+  - Admin scope requires approval from a workspace owner.
+
+Rate Limiting
+-------------
+All API endpoints are rate-limited. Limits vary by plan:
+
+  Plan           Requests/Minute    Burst Allowance
+  ----------     ---------------    ---------------
+  Free           60                 10
+  Pro            500                50
+  Enterprise     2000               200
+
+Rate limit information is included in every response header:
+
+  Header                    Description
+  -----------------------   ------------------------------------------
+  X-RateLimit-Limit         Maximum requests allowed per window.
+  X-RateLimit-Remaining     Requests remaining in the current window.
+  X-RateLimit-Reset         Unix timestamp when the window resets.
+
+================================================================================
+2. ENDPOINTS
+================================================================================
+
+Base URL: https://api.nexus-platform.io
+
+All request and response bodies use JSON. Include the header
+"Content-Type: application/json" for all POST and PUT requests.
+
+--------------------------------------------------------------------------------
+POST /api/v1/notifications - Send a Notification
+--------------------------------------------------------------------------------
+Queues a notification for delivery through the specified channel.
+
+Request Body:
+  {
+    "recipient": "user@example.com",
+    "message": "Your deployment completed successfully.",
+    "channel": "email",
+    "priority": "normal",
+    "scheduled_at": "2025-02-01T09:00:00Z"
+  }
+
+Parameters:
+
+  Field          Type     Required   Description
+  -----------    -----    --------   ----------------------------------------
+  recipient      string   Yes        Email address or Nexus user ID of the
+                                      recipient.
+  message        string   Yes        Notification body text. Minimum 1
+                                      character, maximum 1000 characters.
+  channel        enum     Yes        Delivery channel. One of: email, sms,
+                                      slack, webhook.
+  priority       enum     No         Delivery priority. One of: normal, high,
+                                      urgent. Default: normal.
+  scheduled_at   string   No         ISO 8601 datetime for delayed delivery.
+                                      If omitted, the notification is sent
+                                      immediately.
+
+Response (201 Created):
+  {
+    "id": "notif_7x8y9z0a1b2c3d4e",
+    "status": "queued",
+    "created_at": "2025-01-15T10:30:00Z"
+  }
+
+--------------------------------------------------------------------------------
+GET /api/v1/notifications/{id} - Get Notification Status
+--------------------------------------------------------------------------------
+Retrieves the current delivery status of a notification.
+
+Path Parameters:
+
+  Parameter   Type     Description
+  --------    -----    ----------------------------------------
+  id          string   The notification ID (e.g., notif_7x8y9z0a1b2c3d4e).
+
+Response (200 OK):
+  {
+    "id": "notif_7x8y9z0a1b2c3d4e",
+    "status": "delivered",
+    "attempts": 1,
+    "last_attempt_at": "2025-01-15T10:30:05Z",
+    "recipient": "user@example.com",
+    "channel": "email"
+  }
+
+Status Values:
+
+  Status       Meaning
+  --------     ----------------------------------------------------------
+  queued       Notification is waiting to be processed.
+  sent         Notification has been dispatched to the provider.
+  delivered    Provider confirmed successful delivery.
+  failed       Delivery failed after all retry attempts were exhausted.
+
+--------------------------------------------------------------------------------
+POST /api/v1/webhooks - Register a Webhook
+--------------------------------------------------------------------------------
+Creates a new webhook endpoint to receive event notifications.
+
+Request Body:
+  {
+    "url": "https://your-server.com/webhooks/nexus",
+    "events": ["notification.sent", "notification.failed"],
+    "secret": "whsec_abcdef123456",
+    "description": "Production alert webhook"
+  }
+
+Parameters:
+
+  Field          Type      Required   Description
+  -----------    -----     --------   ----------------------------------------
+  url            string    Yes        HTTPS URL to receive webhook payloads.
+  events         array     Yes        Array of event type strings. See
+                                       Section 5 for all available types.
+  secret         string    No         Used to sign payloads (HMAC-SHA256).
+                                       If omitted, one is generated for you.
+  description    string    No         Human-readable description of the
+                                       webhook's purpose.
+
+Response (201 Created):
+  {
+    "id": "wh_9f8e7d6c5b4a3z2y",
+    "url": "https://your-server.com/webhooks/nexus",
+    "events": ["notification.sent", "notification.failed"],
+    "secret": "whsec_abcdef123456",
+    "description": "Production alert webhook",
+    "created_at": "2025-01-15T11:00:00Z"
+  }
+
+--------------------------------------------------------------------------------
+DELETE /api/v1/webhooks/{id} - Remove a Webhook
+--------------------------------------------------------------------------------
+Permanently removes a registered webhook.
+
+Path Parameters:
+
+  Parameter   Type     Description
+  --------    -----    ----------------------------------------
+  id          string   The webhook ID (e.g., wh_9f8e7d6c5b4a3z2y).
+
+Response (204 No Content):
+  No response body is returned on success.
+
+--------------------------------------------------------------------------------
+GET /api/v1/integrations - List Active Integrations
+--------------------------------------------------------------------------------
+Returns a list of all integrations configured for the workspace.
+
+Query Parameters:
+
+  Parameter   Type     Required   Description
+  --------    -----    --------   ----------------------------------------
+  status      string   No         Filter by status: active, inactive.
+  type        string   No         Filter by type: slack, email, sms, webhook.
+
+Response (200 OK):
+  {
+    "data": [
+      {
+        "id": "int_1a2b3c4d5e6f7g8h",
+        "type": "slack",
+        "status": "active",
+        "name": "Engineering Alerts",
+        "created_at": "2024-11-20T08:00:00Z",
+        "last_event_at": "2025-01-15T09:45:00Z"
+      }
+    ],
+    "next_cursor": null,
+    "has_more": false,
+    "total_count": 1
+  }
+
+================================================================================
+3. ERROR RESPONSES
+================================================================================
+
+All errors follow a standard envelope format to simplify error handling in
+client applications.
+
+Error Envelope:
+  {
+    "error": {
+      "code": "NX-1003",
+      "message": "Rate limit exceeded",
+      "details": {
+        "limit": 1000,
+        "remaining": 0,
+        "reset_at": "2025-01-15T12:00:00Z"
+      }
+    }
+  }
+
+Fields:
+
+  Field       Type     Description
+  --------    -----    -----------------------------------------------
+  code        string   Machine-readable error code (format: NX-XXXX).
+  message     string   Human-readable description of the error.
+  details     object   Optional. Additional context specific to the error.
+
+HTTP Status Codes
+-----------------
+
+  Status   Code       Meaning
+  ------   -------    --------------------------------------------------------
+  400      NX-1001    Invalid request body. Missing required fields, malformed
+                      JSON, or invalid enum values. Check the "details" object
+                      for a list of invalid fields.
+  401      NX-1002    Missing or expired authentication token. Verify your API
+                      key is valid and has not expired. See Section 1 for
+                      token refresh instructions.
+  403      NX-1005    Insufficient scope permissions. The API key does not have
+                      the required scope for this operation. Contact your
+                      workspace admin to update key permissions.
+  404      NX-1004    Resource not found. Verify the resource ID is correct and
+                      that it belongs to your workspace.
+  429      NX-1003    Rate limit exceeded. Includes a Retry-After header with
+                      the number of seconds to wait before retrying. See rate
+                      limit details in Section 1.
+  500      NX-2001    Internal server error. An automatic incident is created
+                      and the on-call team is notified. No client action is
+                      required beyond retrying after a brief delay.
+
+================================================================================
+4. PAGINATION
+================================================================================
+
+All list endpoints use cursor-based pagination for consistent performance
+regardless of dataset size.
+
+Query Parameters:
+
+  Parameter    Type      Description
+  ---------    -----     -----------------------------------------------
+  cursor       string    Opaque cursor string from a previous response.
+                          Omit this parameter to retrieve the first page.
+  page_size    integer   Number of results per page. Default: 50, Max: 200.
+
+Response Fields:
+
+  Field         Type      Description
+  ----------    -----     -----------------------------------------------
+  next_cursor   string    Cursor to pass in the next request. Null if there
+                           are no more results.
+  has_more      boolean   True if additional pages of results exist.
+  total_count   integer   Total number of results across all pages.
+
+Example - First Request:
+  GET /api/v1/integrations?page_size=2
+
+  {
+    "data": [...],
+    "next_cursor": "eyJpZCI6IjEyMzQ1NiJ9",
+    "has_more": true,
+    "total_count": 7
+  }
+
+Example - Next Page:
+  GET /api/v1/integrations?cursor=eyJpZCI6IjEyMzQ1NiJ9&page_size=2
+
+  {
+    "data": [...],
+    "next_cursor": null,
+    "has_more": false,
+    "total_count": 7
+  }
+
+================================================================================
+5. WEBHOOK EVENT TYPES
+================================================================================
+
+The following event types can be subscribed to when registering a webhook
+(see POST /api/v1/webhooks in Section 2).
+
+Notification Events
+-------------------
+
+  Event Type              Trigger
+  --------------------    --------------------------------------------------
+  notification.sent       Fired when a notification is successfully sent
+                            to the delivery provider.
+  notification.failed     Fired when a notification delivery fails after
+                            all retry attempts have been exhausted.
+  notification.queued     Fired when a notification enters the processing
+                            queue and is awaiting delivery.
+
+Integration Events
+------------------
+
+  Event Type                  Trigger
+  ------------------------    -----------------------------------------------
+  integration.connected       Fired when a new integration is activated and
+                                passes its initial health check.
+  integration.disconnected    Fired when an integration is manually
+                                deactivated or fails a health check.
+
+Webhook Payload Structure
+--------------------------
+Every webhook payload, regardless of event type, includes the following
+top-level fields:
+
+  {
+    "event_type": "notification.sent",
+    "timestamp": "2025-01-15T10:30:05Z",
+    "data": {
+      "id": "notif_7x8y9z0a1b2c3d4e",
+      "recipient": "user@example.com",
+      "channel": "email",
+      "status": "sent"
+    },
+    "request_id": "req_1a2b3c4d5e6f7g8h"
+  }
+
+Fields:
+
+  Field          Type      Description
+  -----------    -----     -----------------------------------------------
+  event_type     string    The event that triggered the webhook.
+  timestamp      string    ISO 8601 datetime of when the event occurred.
+  data           object    Event-specific payload. Structure varies by
+                           event type.
+  request_id     string    Unique identifier for correlating the event
+                           with API requests and support inquiries.
+
+Signature Verification
+-----------------------
+If a secret was provided during webhook registration, each delivery includes
+an X-Nexus-Signature header containing the HMAC-SHA256 signature of the
+raw request body. Use this to verify that the payload was sent by Nexus and
+has not been tampered with.
+
+  Example header:
+    X-Nexus-Signature: sha256=a1b2c3d4e5f6g7h8i9j0k1l2m3n4o5p6q7r8s9t0
+
+  Verification pseudocode:
+    expected = hmac_sha256(webhook_secret, raw_request_body)
+    assert_equals(expected, signature_from_header)
+
+================================================================================
+For questions or support, contact the API team at api-support@nexus-platform.io
+or visit docs.nexus-platform.io for interactive examples and SDKs.
+
+API Status: status.nexus-platform.io
+Service Agreement: nexus-platform.io/terms
+
+Last updated: January 2025
+================================================================================

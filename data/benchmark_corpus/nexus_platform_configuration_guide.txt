@@ -1,0 +1,320 @@
+================================================================================
+             NEXUS PLATFORM CONFIGURATION GUIDE
+             Version 3.2 | Last Updated: 2026-03-15
+             Copyright (c) 2026 Nexus Technologies, Inc.
+================================================================================
+
+TABLE OF CONTENTS
+  1. System Requirements
+  2. Initial Setup
+  3. Notification Configuration
+  4. Integration Setup
+  5. Advanced Settings
+
+================================================================================
+1. SYSTEM REQUIREMENTS
+================================================================================
+
+Before installing Nexus Platform, ensure your environment meets the following
+minimum and recommended specifications.
+
+1.1 Hardware Requirements
+--------------------------
+  Component          Minimum         Recommended
+  ---------------------------------------------------
+  RAM                8 GB            16 GB
+  Disk Space         2 GB            10 GB
+  CPU                2 cores         4 cores
+
+1.2 Operating Systems
+----------------------
+Nexus Platform supports the following operating systems:
+  - Windows 10 or later
+  - macOS 12 (Monterey) or later
+  - Ubuntu 20.04 or later
+
+Note: Server distributions such as Windows Server 2019+ and RHEL 8+ are also
+supported for self-hosted deployments.
+
+1.3 Supported Browsers
+-----------------------
+  - Google Chrome 90 or later
+  - Mozilla Firefox 88 or later
+  - Microsoft Edge 90 or later
+
+Safari and other Chromium-based browsers may work but are not officially
+tested or supported.
+
+1.4 Network Requirements
+-------------------------
+  - HTTPS is required for all communication with Nexus Platform services.
+  - Outbound traffic must be permitted on port 443.
+  - WebSocket connections (wss://) are used for real-time notifications
+    and require the same port 443 outbound rule.
+
+1.5 Software Dependencies
+--------------------------
+  - Node.js 18.x or later (for CLI tools and webhook handlers)
+  - OpenSSL 1.1.1 or later (for TLS certificate validation)
+
+
+================================================================================
+2. INITIAL SETUP
+================================================================================
+
+This section covers the initial activation and configuration of your Nexus
+Platform instance.
+
+2.1 Account Activation
+-----------------------
+Navigate to the activation portal to begin setup:
+
+  Activation URL: https://admin.nexus-platform.io/activate
+
+You will need the following credentials:
+  - Administrator email address
+  - License key
+
+License key format:
+  NX-XXXX-XXXX-XXXX
+
+  The license key is a 16-character alphanumeric string separated by hyphens
+  into four groups of four characters. Example: NX-A7F2-B9D4-C1E6
+
+2.2 First-Time Setup Wizard
+----------------------------
+After successful activation, the setup wizard guides you through four steps:
+
+  Step 1 - Account Configuration
+    Set your display name, timezone, and language preference.
+
+  Step 2 - Workspace Setup
+    Create your first workspace. The default workspace name is "My Workspace".
+    You can rename it at any time from Workspace Settings.
+
+  Step 3 - Integrations
+    Connect external services (Slack, Jira, PagerDuty, etc.). This step is
+    optional and can be completed later.
+
+  Step 4 - Notifications
+    Configure notification preferences and delivery channels. At minimum,
+    an email channel must be configured during initial setup.
+
+2.3 Workspace Management
+-------------------------
+Each licensed instance supports up to 25 workspaces. Workspace administrators
+can invite additional users via email invitation. User roles include:
+  - Owner (full control, billing)
+  - Admin (configuration, user management)
+  - Member (standard access)
+  - Viewer (read-only access)
+
+
+================================================================================
+3. NOTIFICATION CONFIGURATION
+================================================================================
+
+Nexus Platform delivers notifications through multiple channels. This section
+describes how to configure each delivery method.
+
+3.1 Email (SMTP) Configuration
+-------------------------------
+Email notifications require an SMTP server. Nexus provides a built-in relay,
+or you may use your own SMTP server.
+
+Built-in SMTP settings:
+  SMTP Host:  smtp.nexus-platform.io
+  SMTP Port:  587
+  TLS:        Required (STARTTLS)
+
+Authentication:
+  Username:  Your Nexus Platform account email
+  Password:  Your Nexus Platform account password
+
+SMTP connection example:
+
+  $ openssl s_client -connect smtp.nexus-platform.io:587 -starttls smtp
+
+3.2 Retry Policy
+-----------------
+The notification service implements an automatic retry mechanism:
+  - Maximum retry attempts: 3
+  - Retry interval: 5 minutes between each attempt
+  - Backoff strategy: fixed interval (no exponential backoff)
+
+If all three retry attempts fail, the notification is marked as undeliverable
+and an alert is logged. Administrators can review failed notifications in the
+Notification Dashboard under Settings > Notifications > Failed Deliveries.
+
+3.3 Supported Notification Channels
+-------------------------------------
+  Channel      Configuration Required
+  -----------------------------------------------
+  Email        SMTP credentials
+  SMS          Twilio integration (API key required)
+  Slack        OAuth 2.0 bot token
+  Webhook      HTTPS endpoint URL + secret
+
+3.4 Rate Limits
+----------------
+Notification rate limits are enforced per workspace:
+  - Maximum: 100 notifications per hour
+  - Burst allowance: up to 20 notifications in any 1-minute window
+
+Exceeding the rate limit returns HTTP 429 with a Retry-After header indicating
+when the next notification may be sent.
+
+
+================================================================================
+4. INTEGRATION SETUP
+================================================================================
+
+Integrations allow Nexus Platform to interact with external systems via
+webhooks and API connections.
+
+4.1 Webhook Configuration
+--------------------------
+To receive real-time event notifications, configure a webhook endpoint:
+
+  Webhook URL format:
+    https://api.nexus-platform.io/v1/webhooks/{workspace_id}
+
+  Replace {workspace_id} with your workspace's unique identifier, found in
+  Workspace Settings > General > Workspace ID.
+
+4.2 Authentication
+-------------------
+All webhook requests include a Bearer token in the Authorization header:
+
+  Authorization: Bearer <your_token>
+
+Tokens are generated during integration setup and must be refreshed every
+90 days. The platform sends a warning email 14 days before token expiration.
+
+Token refresh procedure:
+  1. Navigate to Settings > Integrations > API Tokens
+  2. Click "Rotate Token" on the active token
+  3. Update the token in all consuming applications
+  4. The previous token remains valid for 24 hours after rotation
+
+4.3 Supported Event Types
+---------------------------
+The following event types can trigger webhook deliveries:
+
+  Event Type                      Description
+  -----------------------------------------------------------------------
+  notification.sent               A notification was successfully delivered
+  notification.failed             A notification delivery attempt failed
+  integration.connected           An external integration was established
+  integration.disconnected        An external integration was terminated
+
+Each webhook payload includes: event_type, timestamp, workspace_id, payload,
+and a signature for verification.
+
+4.4 Webhook Limits
+-------------------
+  - Maximum concurrent webhooks: 50 per workspace
+  - Maximum payload size: 256 KB
+  - Request timeout: 10 seconds (delivery is marked failed on timeout)
+  - Response expectation: HTTP 200 from your endpoint to confirm receipt
+
+
+================================================================================
+5. ADVANCED SETTINGS
+================================================================================
+
+This section describes advanced configuration options available to workspace
+administrators.
+
+5.1 API Rate Limits
+--------------------
+Rate limits are enforced based on your subscription tier:
+
+  Tier          Requests per Hour    Burst Limit
+  -------------------------------------------------
+  Standard      1,000                50/second
+  Enterprise    5,000                200/second
+
+Rate limit headers are included in every API response:
+  X-RateLimit-Limit:     Maximum requests allowed per hour
+  X-RateLimit-Remaining: Requests remaining in current window
+  X-RateLimit-Reset:     Unix timestamp when the window resets
+
+5.2 Batch Operations
+---------------------
+  Default batch size:   50 records
+  Maximum batch size:   500 records
+  Maximum payload size: 10 MB per batch request
+
+Batch requests that exceed the maximum size return HTTP 413 (Payload Too Large).
+
+5.3 Request Timeout
+--------------------
+  Default timeout:   30 seconds
+  Configurable range: 5-120 seconds
+
+To adjust the timeout, update your workspace configuration:
+
+  PATCH /api/v1/workspaces/{workspace_id}
+  Content-Type: application/json
+
+  {
+    "settings": {
+      "request_timeout_seconds": 45
+    }
+  }
+
+5.4 Logging
+------------
+Logging levels control the verbosity of system logs:
+
+  Level     Description
+  -----------------------------------------------
+  DEBUG     Detailed diagnostic information
+  INFO      General operational messages (default)
+  WARN      Warning conditions requiring attention
+  ERROR     Error conditions requiring investigation
+
+The default logging level is INFO. Debug logging should only be enabled
+temporarily for troubleshooting, as it generates significant log volume.
+
+To change the logging level via CLI:
+
+  $ nexus-cli config set logging.level WARN
+
+5.5 Data Retention
+-------------------
+Data retention policies determine how long historical data is preserved:
+
+  Tier          Retention Period
+  -----------------------------------
+  Standard      90 days
+  Enterprise    365 days
+
+Expired data is permanently deleted and cannot be recovered. Enterprise
+customers may request extended retention by contacting their account manager.
+
+5.6 IP Allowlist
+-----------------
+Restrict access to your workspace by configuring an IP allowlist:
+
+  - Maximum entries: 20 CIDR ranges
+  - Both IPv4 and IPv6 ranges are supported
+  - Changes take effect within 60 seconds
+
+Example configuration:
+
+  $ nexus-cli allowlist add --range 203.0.113.0/24
+  $ nexus-cli allowlist add --range 2001:db8::/32
+  $ nexus-cli allowlist list
+
+  Range               Added
+  -------------------------------------------
+  203.0.113.0/24      2026-02-10T14:30:00Z
+  2001:db8::/32       2026-02-10T14:32:00Z
+
+================================================================================
+END OF DOCUMENT
+Nexus Platform Configuration Guide v3.2
+For support, visit https://support.nexus-platform.io
+================================================================================
