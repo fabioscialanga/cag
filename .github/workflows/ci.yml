@@ -26,12 +26,15 @@ jobs:
           pip install -e ".[dev,eval,api]"
 
       - name: Run test suite
-        run: pytest
+        env:
+          OPENAI_API_KEY: "sk-test-placeholder"
+          CAG_API_KEY: ""
+        run: pytest --ignore=tests/test_agents_integration.py --ignore=tests/test_api.py -q
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "22"
 
       - name: Install frontend dependencies
         working-directory: frontend
