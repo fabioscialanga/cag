@@ -6,6 +6,7 @@ Provides the ``cag`` console command with subcommands:
     cag ingest   -- run the ingestion pipeline
     cag query    -- run a single query against the CAG graph
     cag eval     -- run a benchmark evaluation
+    cag eval-audit -- inspect benchmark dataset readiness
     cag compare  -- compare benchmark run artifacts
 """
 from __future__ import annotations
@@ -97,6 +98,26 @@ def _cmd_compare(args: argparse.Namespace) -> None:
     compare_main(compare_argv)
 
 
+def _cmd_eval_audit(args: argparse.Namespace) -> None:
+    _setup_logging()
+    from cag.eval.audit import main as audit_main
+
+    audit_argv: list[str] = []
+    if args.dataset:
+        audit_argv.extend(["--dataset", args.dataset])
+    if args.data_dir:
+        audit_argv.extend(["--data-dir", args.data_dir])
+    if args.min_total is not None:
+        audit_argv.extend(["--min-total", str(args.min_total)])
+    if args.min_per_query_type is not None:
+        audit_argv.extend(["--min-per-query-type", str(args.min_per_query_type)])
+    if args.format:
+        audit_argv.extend(["--format", args.format])
+    if args.output:
+        audit_argv.extend(["--output", args.output])
+    audit_main(audit_argv or None)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="cag",
@@ -118,7 +139,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     # --- cag eval ---
     eval_parser = subparsers.add_parser("eval", help="Run a benchmark evaluation")
-    eval_parser.add_argument("--system", choices=["cag", "rag_baseline", "direct_baseline", "lightrag_baseline"], required=True)
+    eval_parser.add_argument(
+        "--system",
+        choices=["cag", "cag_no_selection", "rag_baseline", "direct_baseline", "lightrag_baseline"],
+        required=True,
+    )
     eval_parser.add_argument("--dataset", default=None, help="Path to benchmark JSONL dataset")
     eval_parser.add_argument("--data-dir", default="./data/benchmark_corpus")
     eval_parser.add_argument("--judge-mode", choices=["auto", "off", "required"], default="auto")
@@ -127,6 +152,16 @@ def build_parser() -> argparse.ArgumentParser:
     eval_parser.add_argument("--runs", type=int, default=1)
     eval_parser.add_argument("--output-dir", default="./artifacts/eval_runs")
     eval_parser.set_defaults(func=_cmd_eval)
+
+    # --- cag eval-audit ---
+    audit_parser = subparsers.add_parser("eval-audit", help="Inspect benchmark dataset readiness")
+    audit_parser.add_argument("--dataset", default=None, help="Path to benchmark JSONL dataset")
+    audit_parser.add_argument("--data-dir", default="./data/benchmark_corpus")
+    audit_parser.add_argument("--min-total", type=int, default=100)
+    audit_parser.add_argument("--min-per-query-type", type=int, default=20)
+    audit_parser.add_argument("--format", choices=["markdown", "json"], default="markdown")
+    audit_parser.add_argument("--output", default=None, help="Optional output file path")
+    audit_parser.set_defaults(func=_cmd_eval_audit)
 
     # --- cag compare ---
     compare_parser = subparsers.add_parser("compare", help="Compare benchmark run artifacts")

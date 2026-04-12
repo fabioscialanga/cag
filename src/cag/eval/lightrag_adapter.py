@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from cag.config import settings
-from cag.eval.corpus import collect_benchmark_sources, load_selected_documents
+from cag.eval.corpus import cleanup_temp_path, collect_benchmark_sources, load_selected_documents
 from cag.eval.models import BenchmarkItem, CitationRecord, SystemOutput
 from cag.eval.systems import estimate_cost_units
 
@@ -170,7 +170,7 @@ class LightRAGRuntime(AbstractContextManager["LightRAGRuntime"]):
         self.benchmark_items = benchmark_items
         self.top_k = top_k
         self.allowed_sources = collect_benchmark_sources(benchmark_items)
-        self._tempdir: tempfile.TemporaryDirectory[str] | None = None
+        self._tempdir_path: Path | None = None
         self._rag = None
 
     def build(self) -> "LightRAGRuntime":
@@ -186,7 +186,7 @@ class LightRAGRuntime(AbstractContextManager["LightRAGRuntime"]):
         if not settings.openai_api_key:
             raise RuntimeError("OPENAI_API_KEY is required to run the LightRAG baseline.")
 
-        self._tempdir = tempfile.TemporaryDirectory(prefix="cag_lightrag_")
+        self._tempdir_path = Path(tempfile.mkdtemp(prefix="cag_lightrag_"))
 
         async def llm_model_func(
             prompt,
@@ -218,7 +218,7 @@ class LightRAGRuntime(AbstractContextManager["LightRAGRuntime"]):
             )
 
         self._rag = LightRAG(
-            working_dir=self._tempdir.name,
+            working_dir=str(self._tempdir_path),
             llm_model_func=llm_model_func,
             llm_model_name=settings.active_model_id,
             embedding_func=embedding_func,
@@ -282,12 +282,9 @@ class LightRAGRuntime(AbstractContextManager["LightRAGRuntime"]):
 
         gc.collect()
 
-        if self._tempdir is not None:
-            try:
-                self._tempdir.cleanup()
-            except Exception:
-                pass
-            self._tempdir = None
+        if self._tempdir_path is not None:
+            cleanup_temp_path(self._tempdir_path)
+            self._tempdir_path = None
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()

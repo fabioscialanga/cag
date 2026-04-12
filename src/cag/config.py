@@ -46,6 +46,7 @@ class Settings(BaseSettings):
 
     embedding_model: str = "text-embedding-3-small"
     embedding_dim: int = 1536
+    cag_api_key: str = ""
 
     vector_db: VectorDB = VectorDB.CHROMA
     chroma_persist_dir: Path = Path("./data/chroma_db")

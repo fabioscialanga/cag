@@ -58,6 +58,25 @@ def source_grounding_score(citations: list, gold_sources: list[str]) -> float:
     return len(cited_sources & expected_sources) / len(expected_sources)
 
 
+def context_precision_score(selected_context_sources: list[str], gold_sources: list[str], answerable: bool) -> float | None:
+    if not answerable:
+        return None
+
+    if not selected_context_sources:
+        return 0.0
+
+    expected_sources = {_basename(source) for source in gold_sources}
+    if not expected_sources:
+        return 0.0
+
+    matched = sum(
+        1
+        for source in selected_context_sources
+        if _basename(source) in expected_sources
+    )
+    return matched / len(selected_context_sources)
+
+
 def fallback_judge(item: BenchmarkItem, result: SystemOutput, coverage: float, grounding: float) -> JudgeVerdict:
     if not item.answerable:
         if result.should_escalate:
@@ -89,7 +108,9 @@ def fallback_judge(item: BenchmarkItem, result: SystemOutput, coverage: float, g
 def score_result(item: BenchmarkItem, result: SystemOutput, judge=None) -> ScoredResult:
     coverage = point_coverage(result.answer, item.gold_answer_points)
     grounding = source_grounding_score(result.citations, item.gold_sources)
+    context_precision = context_precision_score(result.selected_context_sources, item.gold_sources, item.answerable)
     verdict = judge.evaluate(item, result) if judge else fallback_judge(item, result, coverage, grounding)
+    base_payload = result.model_dump(exclude={"context_precision_score"})
 
     escalation_correct = result.should_escalate if not item.answerable else not result.should_escalate
     query_type_match = result.query_type.upper() == item.query_type
@@ -121,7 +142,7 @@ def score_result(item: BenchmarkItem, result: SystemOutput, judge=None) -> Score
     )
 
     return ScoredResult(
-        **result.model_dump(),
+        **base_payload,
         expected_query_type=item.query_type,
         answerable=item.answerable,
         gold_answer_points=item.gold_answer_points,
@@ -129,6 +150,7 @@ def score_result(item: BenchmarkItem, result: SystemOutput, judge=None) -> Score
         notes=item.notes,
         point_coverage=coverage,
         source_grounding=grounding,
+        context_precision_score=context_precision,
         unsupported_claim_score=verdict.unsupported_claims,
         grounded_answer_score=min(1.0, grounded_score),
         task_success=task_success,
@@ -149,11 +171,17 @@ def aggregate_results(results: list[ScoredResult]) -> AggregateMetrics:
     escalations = [result for result in results if result.should_escalate]
     false_escalations = [result for result in answerable if result.should_escalate]
     correct_escalations = [result for result in escalations if not result.answerable]
+    context_precision_values = [
+        result.context_precision_score
+        for result in answerable
+        if result.context_precision_score is not None
+    ]
 
     return AggregateMetrics(
         grounded_answer_score=mean(result.grounded_answer_score for result in results),
         point_coverage=mean(result.point_coverage for result in answerable) if answerable else 0.0,
         source_grounding=mean(result.source_grounding for result in answerable) if answerable else 0.0,
+        context_precision_score=mean(context_precision_values) if context_precision_values else None,
         hallucination_rate=mean(1.0 if result.hallucination_flag else 0.0 for result in results),
         escalation_precision=(len(correct_escalations) / len(escalations) if escalations else None),
         false_escalation_rate=(len(false_escalations) / len(answerable) if answerable else 0.0),

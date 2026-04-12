@@ -6,7 +6,7 @@ from cag.ingestion.chunker import chunk_documents
 from cag.ingestion.embedder import get_embeddings, get_vector_store, similarity_search, upsert_chunks
 from cag.ingestion.loader import load_documents
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "__version__",

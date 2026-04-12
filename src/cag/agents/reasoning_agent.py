@@ -18,6 +18,9 @@ _REASONING_INSTRUCTIONS = [
     "You are the ReasoningAgent of a CAG (Cognitive Augmented Generation) system.",
     "You receive a user question, ranked documentation chunks, and explicit information gaps.",
     "Your job is to generate a structured, grounded, cited answer.",
+    "Answer in the same language as the user query.",
+    "Detect the language of the user query and respond in that language.",
+    "Preserve the user's language unless they explicitly request a different one.",
     "",
     "QUERY TYPES AND RESPONSE SHAPE:",
     "- DIAGNOSTIC: structure as Cause -> Check -> Resolution.",
@@ -96,6 +99,8 @@ def run_reasoning_agent(
     ranked_chunks: list[dict],
     gaps: list[str],
     query_type_hint: str = "GENERAL",
+    response_language: str = "en",
+    retry_guidance: str = "",
 ) -> ReasoningOutput:
     """Generate a grounded answer from ranked evidence."""
 
@@ -114,6 +119,9 @@ def run_reasoning_agent(
     context = "\n\n".join(
         (
             f"[SOURCE {index + 1}: {chunk.get('source', 'N/A')} | "
+            f"Chunk: {chunk.get('chunk_index', 0)} | "
+            f"Cluster: {chunk.get('cluster_id', 'cluster_1')} | "
+            f"Category: {chunk.get('selection_category', 'general')} | "
             f"Relevance: {chunk.get('relevance_score', 0):.2f}]\n"
             f"{chunk.get('content', '')}"
         )
@@ -122,9 +130,11 @@ def run_reasoning_agent(
 
     gaps_text = "\n".join(f"- {gap}" for gap in gaps) if gaps else "No explicit gaps identified."
     mode_instruction = MODE_INSTRUCTIONS.get(query_type_hint, MODE_INSTRUCTIONS["GENERAL"])
+    retry_guidance_text = retry_guidance.strip() or "No retry guidance."
 
     prompt = f"""USER QUERY: {query}
 SUGGESTED QUERY TYPE: {query_type_hint}
+RESPONSE LANGUAGE: {response_language}
 MODE INSTRUCTIONS: {mode_instruction}
 
 DOCUMENT CONTEXT:
@@ -132,6 +142,9 @@ DOCUMENT CONTEXT:
 
 IDENTIFIED GAPS:
 {gaps_text}
+
+RETRY GUIDANCE:
+{retry_guidance_text}
 
 Build the structured answer and return JSON only.
 Focus on the user's explicit request and avoid lateral context unless it is necessary to answer.
@@ -149,14 +162,27 @@ If the documentation does not cover the core of the request, say so clearly and 
 
     except Exception as exc:
         logger.error("ReasoningAgent error: %s", exc)
+        error_messages = {
+            "it": "Si e' verificato un errore interno durante la generazione della risposta. "
+                  "Riprova oppure fornisci altro materiale di supporto.",
+            "en": "An internal error occurred while generating the answer. "
+                  "Please try again or provide additional source material.",
+            "fr": "Une erreur interne s'est produite lors de la génération de la réponse. "
+                  "Veuillez réessayer ou fournir du matériel source supplémentaire.",
+            "de": "Beim Generieren der Antwort ist ein interner Fehler aufgetreten. "
+                  "Bitte versuchen Sie es erneut oder stellen Sie zusätzliches Quellenmaterial zur Verfügung.",
+            "es": "Se produjo un error interno al generar la respuesta. "
+                  "Inténtelo de nuevo o proporcione material de origen adicional.",
+            "pt": "Ocorreu um erro interno ao gerar a resposta. "
+                  "Tente novamente ou forneça material de origem adicional.",
+        }
         return ReasoningOutput(
-            answer=(
-                "An internal error occurred while generating the answer. "
-                "Please try again or provide additional source material."
-            ),
+            answer=error_messages.get(response_language, error_messages["en"]),
             query_type="GENERAL",
             confidence=0.0,
             citations=[],
             hallucination_risk=1.0,
             hallucination_reason=f"Internal reasoning agent error: {str(exc)[:200]}",
+            fallback_used=True,
+            fallback_reason="reasoning_agent_error",
         )

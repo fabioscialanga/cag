@@ -60,7 +60,7 @@ if "last_result" not in st.session_state:
     st.session_state.last_result = None
 
 with st.sidebar:
-    st.markdown("## 🧠 CAG v0.1")
+    st.markdown("## 🧠 CAG v0.2")
     st.markdown("*Cognitive Augmented Generation*")
     st.divider()
 
@@ -154,7 +154,7 @@ if not st.session_state.messages:
     with st.chat_message("assistant"):
         st.markdown(
             """
-Hello. I am your document intelligence assistant built on **CAG v0.1**.
+Hello. I am your document intelligence assistant built on **CAG v0.2**.
 
 I can help with:
 - **Troubleshooting** — identify likely causes and next checks

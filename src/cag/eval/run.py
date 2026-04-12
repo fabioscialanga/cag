@@ -32,7 +32,11 @@ def _write_results(path: Path, results: list[ScoredResult]) -> None:
 
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the CAG scientific benchmark.")
-    parser.add_argument("--system", choices=["cag", "rag_baseline", "direct_baseline", "lightrag_baseline"], required=True)
+    parser.add_argument(
+        "--system",
+        choices=["cag", "cag_no_selection", "rag_baseline", "direct_baseline", "lightrag_baseline"],
+        required=True,
+    )
     parser.add_argument("--dataset", default=None, help="Path to the benchmark JSONL dataset.")
     parser.add_argument("--data-dir", default="./data/benchmark_corpus", help="Directory containing source documents. Default: benchmark corpus.")
     parser.add_argument("--judge-mode", choices=["auto", "off", "required"], default="auto")
@@ -113,14 +117,16 @@ def _compute_multi_run_stats(all_runs: list[list[ScoredResult]]) -> dict[str, Me
 
     per_run_metrics = [aggregate_results(run) for run in all_runs]
     metric_names = [
-        "grounded_answer_score", "point_coverage", "source_grounding",
+        "grounded_answer_score", "point_coverage", "source_grounding", "context_precision_score",
         "hallucination_rate", "task_success_rate", "false_escalation_rate",
         "avg_latency_ms", "avg_cost_estimate",
     ]
 
     stats: dict[str, MetricStats] = {}
     for name in metric_names:
-        values = [getattr(m, name) for m in per_run_metrics]
+        values = [value for value in (getattr(m, name) for m in per_run_metrics) if value is not None]
+        if not values:
+            continue
         stats[name] = MetricStats(
             mean=mean(values),
             std=stdev(values) if len(values) > 1 else 0.0,
@@ -154,12 +160,14 @@ def _compute_multi_run_by_type(
             continue
 
         metric_names = [
-            "grounded_answer_score", "point_coverage", "source_grounding",
+            "grounded_answer_score", "point_coverage", "source_grounding", "context_precision_score",
             "hallucination_rate", "task_success_rate",
         ]
         type_stats: dict[str, MetricStats] = {}
         for name in metric_names:
-            values = [getattr(m, name) for m in per_run_for_type]
+            values = [value for value in (getattr(m, name) for m in per_run_for_type) if value is not None]
+            if not values:
+                continue
             type_stats[name] = MetricStats(
                 mean=mean(values),
                 std=stdev(values) if len(values) > 1 else 0.0,

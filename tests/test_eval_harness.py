@@ -5,16 +5,18 @@ import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from langchain_core.documents import Document
 from pydantic import ValidationError
 
-from cag.eval.corpus import collect_benchmark_sources, load_benchmark_dataset
+from cag.eval.audit import build_dataset_audit
+from cag.eval.corpus import cleanup_temp_path, collect_benchmark_sources, load_benchmark_dataset
 from cag.eval.lightrag_adapter import infer_should_escalate, parse_lightrag_response
 from cag.eval.models import AggregateMetrics, BenchmarkItem, CitationRecord, RunManifest, ScoredResult, SystemOutput
 from cag.eval.scoring import aggregate_results, score_result
-from cag.eval.systems import BaselineGeneration, run_cag_system, run_rag_baseline, run_system
+from cag.eval.systems import BaselineGeneration, run_cag_no_selection, run_cag_system, run_rag_baseline, run_system
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -50,6 +52,22 @@ def test_invalid_benchmark_item_raises_validation_error(tmp_path: Path):
         load_benchmark_dataset(invalid_path)
 
 
+def test_cleanup_temp_path_removes_directory_tree(tmp_path: Path):
+    temp_dir = tmp_path / "cag_eval_temp"
+    temp_dir.mkdir()
+    (temp_dir / "nested.txt").write_text("temp", encoding="utf-8")
+
+    cleanup_temp_path(temp_dir)
+
+    assert not temp_dir.exists()
+
+
+def test_cleanup_temp_path_ignores_missing_targets(tmp_path: Path):
+    missing = tmp_path / "missing_dir"
+    cleanup_temp_path(missing)
+    assert not missing.exists()
+
+
 def test_runners_share_the_same_retrieval_top_k():
     calls: list[int] = []
     docs = [
@@ -63,10 +81,9 @@ def test_runners_share_the_same_retrieval_top_k():
         calls.append(k)
         return docs
 
-    def fake_query_runner(question: str, conversation_history=None):
-        from cag.graph.nodes import similarity_search
-
-        similarity_search(question)
+    def fake_query_runner(question: str, conversation_history=None, search_fn=None):
+        if search_fn is not None:
+            search_fn(question, 7)
         return {
             "answer": "Supported answer",
             "citations": [{"text": "Test context", "source": "team_handbook_setup.txt", "domain_module": "workflow"}],
@@ -74,6 +91,8 @@ def test_runners_share_the_same_retrieval_top_k():
             "confidence": 0.8,
             "hallucination_risk": 0.1,
             "should_escalate": False,
+            "fallback_used": False,
+            "fallback_reason": "",
             "node_trace": ["ENTRY", "RETRIEVE", "REFINE", "REASON(retry=0)", "VALIDATE", "EXIT"],
         }
 
@@ -96,6 +115,63 @@ def test_runners_share_the_same_retrieval_top_k():
     assert calls == [7, 7, 7]
 
 
+def test_cag_and_cag_no_selection_share_the_same_selected_context_budget():
+    docs = [
+        Document(
+            page_content=f"Context chunk {index}",
+            metadata={"filename": f"source_{index}.txt", "domain_module": "workflow", "chunk_index": index},
+        )
+        for index in range(8)
+    ]
+
+    def search_fn(query: str, k: int):
+        return docs
+
+    def fake_query_runner(question: str, conversation_history=None, search_fn=None):
+        ranked_chunks = [
+            {
+                "content": doc.page_content,
+                "source": doc.metadata["filename"],
+                "domain_module": doc.metadata["domain_module"],
+                "chunk_index": doc.metadata["chunk_index"],
+                "cluster_id": "cluster_1",
+                "selection_category": "setup",
+                "relevance_score": 0.9 - (doc.metadata["chunk_index"] * 0.01),
+                "relevance_reason": "Test ranking",
+            }
+            for doc in docs
+        ]
+        return {
+            "answer": "Supported answer",
+            "chunks": ranked_chunks,
+            "ranked_chunks": ranked_chunks,
+            "citations": [],
+            "query_type": "CONFIGURATION",
+            "confidence": 0.8,
+            "hallucination_risk": 0.1,
+            "should_escalate": False,
+            "fallback_used": False,
+            "fallback_reason": "",
+            "node_trace": ["ENTRY", "RETRIEVE", "REFINE", "REASON(retry=0)", "VALIDATE", "EXIT"],
+        }
+
+    cag_result = run_cag_system("q1", "How do I configure the workflow?", search_fn, top_k=8, query_runner=fake_query_runner)
+    no_selection_result = run_cag_no_selection(
+        "q1",
+        "How do I configure the workflow?",
+        search_fn,
+        top_k=8,
+        query_runner=fake_query_runner,
+    )
+
+    assert cag_result.retrieved_chunk_count == 8
+    assert no_selection_result.retrieved_chunk_count == 8
+    assert cag_result.selected_chunk_count == 6
+    assert no_selection_result.selected_chunk_count == 6
+    assert len(cag_result.selected_context_sources) == 6
+    assert len(no_selection_result.selected_context_sources) == 6
+
+
 def test_scoring_covers_supported_and_unsupported_cases():
     answerable_item = BenchmarkItem(
         id="supported",
@@ -114,11 +190,13 @@ def test_scoring_covers_supported_and_unsupported_cases():
         system="cag",
         answer="An active project and an assigned owner are required before using the workflow.",
         citations=[CitationRecord(source="team_handbook_setup.txt", text="...", domain_module="workflow")],
+        selected_context_sources=["team_handbook_setup.txt"],
         query_type="CONFIGURATION",
         should_escalate=False,
     )
     supported_score = score_result(answerable_item, supported_output, judge=None)
     assert supported_score.point_coverage == 1.0
+    assert supported_score.context_precision_score == 1.0
     assert supported_score.task_success is True
     assert supported_score.hallucination_flag is False
 
@@ -128,11 +206,13 @@ def test_scoring_covers_supported_and_unsupported_cases():
         system="rag_baseline",
         answer="An active project is required.",
         citations=[CitationRecord(source="team_handbook_setup.txt", text="...", domain_module="workflow")],
+        selected_context_sources=["wrong_source.txt"],
         query_type="CONFIGURATION",
         should_escalate=False,
     )
     incomplete_score = score_result(answerable_item, incomplete_output, judge=None)
     assert incomplete_score.point_coverage < 1.0
+    assert incomplete_score.context_precision_score == 0.0
     assert incomplete_score.task_success is False
 
     unsupported_item = BenchmarkItem(
@@ -154,6 +234,7 @@ def test_scoring_covers_supported_and_unsupported_cases():
     )
     escalation_score = score_result(unsupported_item, escalation_output, judge=None)
     assert escalation_score.task_success is True
+    assert escalation_score.context_precision_score is None
     assert escalation_score.grounded_answer_score == 1.0
 
     hallucinated_output = SystemOutput(
@@ -249,6 +330,7 @@ def test_compare_cli_is_reproducible_on_same_inputs(tmp_path: Path):
     second = json.loads((comparison_dirs[1] / "comparison.json").read_text(encoding="utf-8"))
     assert first["claim_verdict"] == second["claim_verdict"]
     assert first["metrics_by_system"] == second["metrics_by_system"]
+    assert first["delta_vs_rag_baseline"] == second["delta_vs_rag_baseline"]
 
 
 def test_parse_lightrag_response_extracts_references():
@@ -517,8 +599,13 @@ def test_compare_cli_supports_multi_run_directories(tmp_path: Path):
     comparison_dirs = sorted(output_base.iterdir())
     assert len(comparison_dirs) == 1
     payload = json.loads((comparison_dirs[0] / "comparison.json").read_text(encoding="utf-8"))
+    comparison_markdown = (comparison_dirs[0] / "comparison.md").read_text(encoding="utf-8")
     assert payload["run_counts_by_system"] == {"cag": 2, "rag_baseline": 2}
     assert payload["statistical_test"]["n_pairs"] == 1
+    assert "delta_vs_rag_baseline" in payload
+    assert payload["delta_vs_rag_baseline"]["cag"]["grounded_answer_score"] > 0
+    assert "Context Precision" in comparison_markdown
+    assert "Delta vs RAG Baseline" in comparison_markdown
 
 
 def test_cag_cli_module_entrypoint_shows_usage():
@@ -548,6 +635,7 @@ def test_multi_run_aggregation():
             expected_query_type="GENERAL",
             answerable=True,
             grounded_answer_score=0.8,
+            context_precision_score=0.8,
             task_success=True,
         )
     ]
@@ -562,6 +650,7 @@ def test_multi_run_aggregation():
             expected_query_type="GENERAL",
             answerable=True,
             grounded_answer_score=0.9,
+            context_precision_score=0.6,
             task_success=True,
         )
     ]
@@ -573,3 +662,192 @@ def test_multi_run_aggregation():
     assert gas.n == 2
     assert abs(gas.mean - 0.85) < 0.001
     assert abs(gas.std - 0.0707) < 0.01
+    assert "context_precision_score" in stats
+    assert abs(stats["context_precision_score"].mean - 0.7) < 0.001
+
+
+def test_dataset_audit_flags_invalid_items_and_coverage_gaps(tmp_path: Path):
+    dataset_path = tmp_path / "audit_dataset.jsonl"
+    dataset_path.write_text(
+        "\n".join(
+            [
+                json.dumps(
+                    {
+                        "id": "dup_01",
+                        "question": "What is the logging level?",
+                        "query_type": "GENERAL",
+                        "gold_answer_points": ["INFO"],
+                        "gold_sources": ["nexus_platform_configuration_guide.txt"],
+                        "answerable": True,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "id": "dup_01",
+                        "question": "What is the logging level?",
+                        "query_type": "GENERAL",
+                        "gold_answer_points": ["INFO"],
+                        "gold_sources": [],
+                        "answerable": True,
+                    }
+                ),
+                json.dumps(
+                    {
+                        "id": "cfg_01",
+                        "question": "How do I rotate the SMTP password?",
+                        "query_type": "CONFIGURATION",
+                        "gold_answer_points": ["Update SMTP credentials"],
+                        "gold_sources": ["nexus_platform_configuration_guide.txt"],
+                        "answerable": True,
+                    }
+                ),
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    data_dir = tmp_path / "corpus"
+    data_dir.mkdir()
+    (data_dir / "nexus_platform_configuration_guide.txt").write_text("config", encoding="utf-8")
+    (data_dir / "nexus_employee_handbook.txt").write_text("handbook", encoding="utf-8")
+
+    audit = build_dataset_audit(
+        load_benchmark_dataset(dataset_path),
+        dataset_path,
+        data_dir,
+        min_total=10,
+        min_per_query_type=2,
+    )
+
+    assert audit.readiness == "invalid"
+    assert audit.duplicate_ids == ["dup_01"]
+    assert audit.duplicate_questions == ["what is the logging level?"]
+    assert audit.answerable_without_gold_sources == ["dup_01"]
+    assert audit.uncovered_corpus_sources == ["nexus_employee_handbook.txt"]
+    assert any("recommended minimum" in issue.lower() for issue in audit.issues)
+
+
+def test_eval_audit_cli_outputs_json(tmp_path: Path):
+    dataset_path = tmp_path / "audit_dataset.jsonl"
+    dataset_path.write_text(
+        json.dumps(
+            {
+                "id": "gen_01",
+                "question": "What is the minimum RAM required to run Nexus Platform?",
+                "query_type": "GENERAL",
+                "gold_answer_points": ["8 GB"],
+                "gold_sources": ["nexus_platform_configuration_guide.txt"],
+                "answerable": True,
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    data_dir = tmp_path / "corpus"
+    data_dir.mkdir()
+    (data_dir / "nexus_platform_configuration_guide.txt").write_text("config", encoding="utf-8")
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "cag.cli",
+            "eval-audit",
+            "--dataset",
+            str(dataset_path),
+            "--data-dir",
+            str(data_dir),
+            "--format",
+            "json",
+            "--min-total",
+            "1",
+            "--min-per-query-type",
+            "1",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+
+    payload = json.loads(completed.stdout)
+    assert payload["readiness"] == "ready"
+    assert payload["total_count"] == 1
+    assert payload["gold_source_usage"]["nexus_platform_configuration_guide.txt"] == 1
+
+
+def test_cag_cli_eval_supports_cag_no_selection():
+    from cag.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["eval", "--system", "cag_no_selection"])
+    assert args.system == "cag_no_selection"
+
+
+def test_run_query_uses_injected_search_function():
+    from cag.graph.graph import run_query
+
+    class FakeDoc:
+        page_content = "Workflow setup instructions."
+        metadata = {"filename": "workflow.txt", "source": "workflow.txt", "domain_module": "workflow", "chunk_index": 0}
+
+    calls: list[tuple[str, int | None]] = []
+
+    def fake_search(query: str, k: int | None = None):
+        calls.append((query, k))
+        return [FakeDoc()]
+
+    from cag.agents.models import Citation, ReasoningOutput, RankedChunk, RetrievalOutput
+
+    with patch(
+        "cag.graph.nodes.run_retrieval_agent",
+        return_value=RetrievalOutput(
+            chunks_ranked=[
+                RankedChunk(
+                    content="Workflow setup instructions.",
+                    source="workflow.txt",
+                    domain_module="workflow",
+                    relevance_score=0.9,
+                    relevance_reason="direct",
+                )
+            ],
+            gaps=[],
+            relevance_score=0.9,
+            summary="ok",
+        ),
+    ), patch(
+        "cag.graph.nodes.run_reasoning_agent",
+        return_value=ReasoningOutput(
+            answer="Workflow setup instructions.",
+            query_type="CONFIGURATION",
+            confidence=0.8,
+            citations=[Citation(text="Workflow setup instructions.", source="workflow.txt", domain_module="workflow")],
+            hallucination_risk=0.1,
+            hallucination_reason="grounded",
+        ),
+    ):
+        result = run_query("How do I configure the workflow?", search_fn=fake_search)
+
+    assert result["answer"]
+    assert calls
+
+
+def test_fallback_flags_are_propagated_in_eval_output():
+    def search_fn(query: str, k: int):
+        return []
+
+    def fake_query_runner(question: str, conversation_history=None, search_fn=None):
+        return {
+            "answer": "Fallback answer",
+            "citations": [],
+            "query_type": "GENERAL",
+            "confidence": 0.0,
+            "hallucination_risk": 1.0,
+            "should_escalate": True,
+            "fallback_used": True,
+            "fallback_reason": "reasoning_agent_error",
+            "node_trace": ["ENTRY", "RETRIEVE", "REFINE", "REASON(retry=0)", "VALIDATE", "EXIT"],
+        }
+
+    result = run_cag_system("q1", "Question", search_fn, top_k=5, query_runner=fake_query_runner)
+    assert result.fallback_used is True
+    assert result.fallback_reason == "reasoning_agent_error"

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
-from unittest.mock import patch
-
 sys.path.insert(0, str(Path.cwd() / "src"))
 
 from cag.agents.models import Citation, ReasoningOutput, RankedChunk, RetrievalOutput
@@ -51,14 +49,19 @@ def test_run_query_basic():
         hallucination_reason="Answer is fully grounded in the provided chunk.",
     )
 
-    with patch("cag.graph.nodes.similarity_search", return_value=[FakeDoc()]), patch(
-        "cag.graph.nodes.run_retrieval_agent",
-        return_value=retrieval_output,
-    ), patch(
+    def fake_search_fn(query: str, k: int | None = None):
+        return [FakeDoc()]
+
+    from unittest.mock import patch
+
+    with patch("cag.graph.nodes.run_retrieval_agent", return_value=retrieval_output), patch(
         "cag.graph.nodes.run_reasoning_agent",
         return_value=reasoning_output,
     ):
-        result = run_query("What fields are required to configure the workflow?")
+        result = run_query(
+            "What fields are required to configure the workflow?",
+            search_fn=fake_search_fn,
+        )
 
     assert isinstance(result, dict)
     for key in ("answer", "node_trace", "should_escalate", "confidence", "query_type"):
@@ -67,3 +70,4 @@ def test_run_query_basic():
     assert isinstance(result.get("node_trace", []), list)
     assert isinstance(result.get("should_escalate", False), bool)
     assert result["query_type"] == "CONFIGURATION"
+    assert result["fallback_used"] is False

@@ -1,1 +1,1 @@
-"""CAG v0.1 - Graph Package"""
+"""CAG v0.2 - Graph Package"""

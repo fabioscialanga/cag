@@ -3,18 +3,27 @@ Unit tests for ingestion, LangGraph nodes, and the core CAG pipeline.
 """
 from __future__ import annotations
 
+import random
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from cag.agents.models import RankedChunk, ReasoningOutput, RetrievalOutput
+from cag.agents.retrieval_agent import (
+    SELECTION_CONTEXT_LIMIT,
+    _build_document_index,
+    _cluster_chunks,
+    _normalize_category,
+    _postprocess_retrieval_output,
+    _reorder_for_context_selection,
+)
 from cag.graph.nodes import (
     entry_node,
     exit_node,
     reason_node,
-    refine_node,
+    select_context_node,
     retrieve_node,
-    route_after_refine,
+    route_after_select_context,
     route_after_validate,
     validate_node,
 )
@@ -36,9 +45,12 @@ def base_state() -> CAGState:
         "citations": [],
         "hallucination_risk": 0.0,
         "query_type": "GENERAL",
+        "response_language": "en",
         "should_escalate": False,
+        "should_retry_reason": False,
         "reason_retries": 0,
         "error_message": "",
+        "retry_guidance": "",
         "node_trace": [],
         "conversation_history": [],
     }
@@ -124,6 +136,11 @@ class TestEntryNode:
         result = entry_node(base_state)
         assert len(result["conversation_history"]) == 1
 
+    def test_infers_italian_response_language(self, base_state):
+        state = {**base_state, "query": "Come configuro il workflow passo per passo?"}
+        result = entry_node(state)
+        assert result["response_language"] == "it"
+
     def test_resets_runtime_fields(self, base_state):
         result = entry_node(base_state)
         assert result["chunks"] == []
@@ -153,17 +170,20 @@ class TestRetrieveNode:
         assert "RETRIEVE" in result["node_trace"]
 
 
-class TestRefineNode:
+class TestSelectContextNode:
     def test_ranks_chunks(self, base_state, mock_retrieval_output):
         state = {**base_state, "chunks": [{"content": "Workflow docs"}], "node_trace": ["ENTRY", "RETRIEVE"]}
 
         with patch("cag.graph.nodes.run_retrieval_agent", return_value=mock_retrieval_output):
-            result = refine_node(state)
+            result = select_context_node(state)
 
         assert result["relevance_score"] == 0.92
         assert len(result["ranked_chunks"]) == 1
+        assert result["ranked_chunks"][0]["chunk_index"] == 0
+        assert result["ranked_chunks"][0]["cluster_id"] == "cluster_1"
+        assert result["ranked_chunks"][0]["selection_category"] == "general"
         assert result["ranked_chunks"][0]["domain_module"] == "workflow"
-        assert "REFINE" in result["node_trace"]
+        assert "SELECT_CONTEXT" in result["node_trace"]
 
 
 class TestReasonNode:
@@ -196,6 +216,22 @@ class TestReasonNode:
             result = reason_node(state)
 
         assert result["query_type"] == "PROCEDURAL"
+
+    def test_passes_retry_guidance_to_reasoning_agent(self, base_state, mock_reasoning_output):
+        state = {
+            **base_state,
+            "ranked_chunks": [{"content": "Workflow docs", "relevance_score": 0.92}],
+            "gaps": [],
+            "retry_guidance": "Use only the strongest evidence.",
+            "node_trace": ["ENTRY", "RETRIEVE", "REFINE", "VALIDATE"],
+        }
+
+        with patch("cag.graph.nodes.run_reasoning_agent", return_value=mock_reasoning_output) as mock_reason:
+            result = reason_node(state)
+
+        assert result["should_retry_reason"] is False
+        assert result["retry_guidance"] == ""
+        assert mock_reason.call_args.kwargs["retry_guidance"] == "Use only the strongest evidence."
 
 
 class TestValidateNode:
@@ -255,22 +291,70 @@ class TestValidateNode:
         result = validate_node(state)
         assert result["should_escalate"] is False
 
+    def test_requests_adaptive_retry_for_high_hallucination_before_max_retries(self, base_state):
+        state = {
+            **base_state,
+            "answer": "A somewhat shaky answer.",
+            "hallucination_risk": 0.6,
+            "confidence": 0.7,
+            "relevance_score": 0.92,
+            "ranked_chunks": [
+                {"content": "strong 1", "relevance_score": 0.95},
+                {"content": "strong 2", "relevance_score": 0.88},
+                {"content": "strong 3", "relevance_score": 0.84},
+                {"content": "weaker 4", "relevance_score": 0.55},
+                {"content": "weaker 5", "relevance_score": 0.32},
+            ],
+            "reason_retries": 1,
+        }
+        result = validate_node(state)
+        assert result["should_escalate"] is False
+        assert result["should_retry_reason"] is True
+        assert result["retry_guidance"]
+        assert len(result["ranked_chunks"]) <= 3
+
+    def test_requests_adaptive_retry_for_low_confidence_before_max_retries(self, base_state):
+        state = {
+            **base_state,
+            "answer": "A narrow but uncertain answer.",
+            "hallucination_risk": 0.1,
+            "confidence": 0.2,
+            "relevance_score": 0.9,
+            "ranked_chunks": [
+                {"content": "strong 1", "relevance_score": 0.91},
+                {"content": "strong 2", "relevance_score": 0.84},
+                {"content": "strong 3", "relevance_score": 0.81},
+                {"content": "weaker", "relevance_score": 0.4},
+            ],
+            "reason_retries": 1,
+        }
+        result = validate_node(state)
+        assert result["should_escalate"] is False
+        assert result["should_retry_reason"] is True
+        assert "narrower" in result["retry_guidance"].lower()
+
 
 class TestRouting:
-    def test_route_after_refine_with_high_relevance(self, base_state):
+    def test_route_after_select_context_with_high_relevance(self, base_state):
         state = {
             **base_state,
             "relevance_score": 0.9,
             "ranked_chunks": [{"content": "chunk", "relevance_score": 0.9}],
         }
-        assert route_after_refine(state) == "reason"
+        assert route_after_select_context(state) == "reason"
 
-    def test_route_after_refine_with_low_relevance(self, base_state):
+    def test_route_after_select_context_with_low_relevance(self, base_state):
         state = {**base_state, "relevance_score": 0.2, "ranked_chunks": []}
-        assert route_after_refine(state) == "validate"
+        assert route_after_select_context(state) == "validate"
 
     def test_route_after_validate_ok(self, base_state):
-        state = {**base_state, "should_escalate": False, "hallucination_risk": 0.05, "reason_retries": 1}
+        state = {
+            **base_state,
+            "should_escalate": False,
+            "should_retry_reason": False,
+            "hallucination_risk": 0.05,
+            "reason_retries": 1,
+        }
         assert route_after_validate(state) == "exit"
 
     def test_route_after_validate_escalation(self, base_state):
@@ -278,7 +362,7 @@ class TestRouting:
         assert route_after_validate(state) == "exit"
 
     def test_route_after_validate_retry(self, base_state):
-        state = {**base_state, "should_escalate": False, "hallucination_risk": 0.6, "reason_retries": 1}
+        state = {**base_state, "should_escalate": False, "should_retry_reason": True, "reason_retries": 1}
         assert route_after_validate(state) == "reason"
 
 
@@ -289,9 +373,38 @@ class TestExitNode:
         assert result["answer"] == "Configuration completed."
 
     def test_returns_escalation_message(self, base_state):
-        state = {**base_state, "should_escalate": True, "error_message": "Documentation is insufficient."}
+        state = {
+            **base_state,
+            "response_language": "it",
+            "should_escalate": True,
+            "error_message": "La documentazione non e' sufficiente.",
+        }
         result = exit_node(state)
-        assert "human" in result["answer"].lower()
+        assert "supporto" in result["answer"].lower()
+        assert "revisore umano" in result["answer"].lower()
+
+    def test_returns_english_escalation_message_for_english_queries(self, base_state):
+        state = {
+            **base_state,
+            "response_language": "en",
+            "should_escalate": True,
+            "error_message": "Documentation is insufficient.",
+        }
+        result = exit_node(state)
+        assert "support escalation recommended" in result["answer"].lower()
+        assert "human reviewer" in result["answer"].lower()
+
+    def test_validate_node_returns_italian_escalation_reason(self, base_state):
+        state = {
+            **base_state,
+            "response_language": "it",
+            "relevance_score": 0.1,
+            "ranked_chunks": [],
+            "reason_retries": 0,
+        }
+        result = validate_node(state)
+        assert result["should_escalate"] is True
+        assert "evidenze" in result["error_message"].lower() or "documentazione" in result["error_message"].lower()
 
 
 class TestIngestion:
@@ -321,3 +434,227 @@ class TestIngestion:
         assert _extract_domain_module("manual_onboarding_workflow") == "onboarding"
         assert _extract_domain_module("guide_asset_register_policy") == "asset"
         assert _extract_domain_module("team_documentation") == "team"
+
+
+class TestSelectionStructure:
+    def test_build_document_index_uses_source_and_chunk_ranges(self):
+        chunks = [
+            {"source": "guide.txt", "domain_module": "workflow", "chunk_index": 0, "content": "Enable notifications."},
+            {"source": "guide.txt", "domain_module": "workflow", "chunk_index": 2, "content": "Assign an owner."},
+            {"source": "runbook.txt", "domain_module": "incident", "chunk_index": 1, "content": "Check the error log."},
+        ]
+
+        index_text = _build_document_index(chunks)
+
+        assert "guide.txt: chunks 0-2; modules=workflow" in index_text
+        assert "runbook.txt: chunks 1; modules=incident" in index_text
+
+    def test_cluster_chunks_groups_related_evidence(self):
+        chunks = [
+            {"source": "guide.txt", "domain_module": "workflow", "content": "Enable notifications and assign an owner."},
+            {"source": "guide.txt", "domain_module": "workflow", "content": "Notification rules control workflow alerts."},
+            {"source": "api.txt", "domain_module": "api", "content": "API tokens expire after 60 minutes."},
+        ]
+
+        assignments = _cluster_chunks(chunks)
+
+        assert assignments[0] == assignments[1]
+        assert assignments[2] != assignments[0]
+
+    def test_normalize_category_maps_common_variants(self):
+        assert _normalize_category("ordered steps") == "ordered_steps"
+        assert _normalize_category("required fields") == "fields"
+        assert _normalize_category("error causes") == "error_causes"
+
+    def test_reorder_for_context_selection_balances_clusters(self):
+        ranked_chunks = [
+            RankedChunk(
+                content="Primary workflow overview.",
+                source="guide.txt",
+                domain_module="workflow",
+                chunk_index=0,
+                cluster_id="cluster_1",
+                selection_category="overview",
+                relevance_score=0.97,
+                relevance_reason="Top overview chunk.",
+            ),
+            RankedChunk(
+                content="Another overview chunk from the same section.",
+                source="guide.txt",
+                domain_module="workflow",
+                chunk_index=1,
+                cluster_id="cluster_1",
+                selection_category="overview",
+                relevance_score=0.95,
+                relevance_reason="Similar chunk.",
+            ),
+            RankedChunk(
+                content="Settings required for the workflow.",
+                source="settings.txt",
+                domain_module="workflow",
+                chunk_index=0,
+                cluster_id="cluster_2",
+                selection_category="settings",
+                relevance_score=0.91,
+                relevance_reason="Important config chunk.",
+            ),
+        ]
+
+        reordered = _reorder_for_context_selection(
+            "How do I configure the workflow settings?",
+            "CONFIGURATION",
+            ranked_chunks,
+        )
+
+        assert reordered[0].cluster_id != reordered[1].cluster_id
+        assert {reordered[0].cluster_id, reordered[1].cluster_id} == {"cluster_1", "cluster_2"}
+
+    def test_reorder_for_context_selection_prioritizes_procedural_steps(self):
+        ranked_chunks = [
+            RankedChunk(
+                content="High-level overview of the workflow.",
+                source="guide.txt",
+                domain_module="workflow",
+                chunk_index=5,
+                cluster_id="cluster_1",
+                selection_category="overview",
+                relevance_score=0.90,
+                relevance_reason="General overview.",
+            ),
+            RankedChunk(
+                content="Step 1 open the menu. Step 2 select Settings.",
+                source="guide.txt",
+                domain_module="workflow",
+                chunk_index=0,
+                cluster_id="cluster_2",
+                selection_category="ordered steps",
+                relevance_score=0.84,
+                relevance_reason="Contains the actual procedure.",
+            ),
+        ]
+
+        reordered = _reorder_for_context_selection(
+            "How do I configure the workflow step by step?",
+            "PROCEDURAL",
+            ranked_chunks,
+        )
+
+        assert reordered[0].selection_category == "ordered steps"
+
+    def test_reorder_for_context_selection_general_prefers_stronger_same_source_evidence(self):
+        ranked_chunks = [
+            RankedChunk(
+                content="NX-1003 means the workspace exceeded the rate limit and returns HTTP 429.",
+                source="runbook.txt",
+                domain_module="incident",
+                chunk_index=0,
+                cluster_id="cluster_1",
+                selection_category="error causes",
+                relevance_score=0.96,
+                relevance_reason="Direct answer chunk.",
+            ),
+            RankedChunk(
+                content="NX-1003 includes a Retry-After header and rate limit metadata.",
+                source="api.txt",
+                domain_module="api",
+                chunk_index=0,
+                cluster_id="cluster_2",
+                selection_category="constraints",
+                relevance_score=0.84,
+                relevance_reason="Useful but secondary detail.",
+            ),
+            RankedChunk(
+                content="The request count exceeded the subscription tier limit for NX-1003.",
+                source="runbook.txt",
+                domain_module="incident",
+                chunk_index=1,
+                cluster_id="cluster_1",
+                selection_category="error causes",
+                relevance_score=0.91,
+                relevance_reason="Same-source supporting detail.",
+            ),
+        ]
+
+        reordered = _reorder_for_context_selection(
+            "What does the NX-1003 error code mean?",
+            "GENERAL",
+            ranked_chunks,
+        )
+
+        assert reordered[0].source == "runbook.txt"
+        assert reordered[1].source == "runbook.txt"
+
+    def test_postprocess_retrieval_output_stress_preserves_chunk_set_and_normalizes_categories(self):
+        rng = random.Random(42)
+        query_types = ["GENERAL", "CONFIGURATION", "DIAGNOSTIC", "PROCEDURAL"]
+        raw_category_variants = [
+            "overview",
+            "ordered steps",
+            "required fields",
+            "permissions",
+            "error causes",
+            "checks",
+            "navigation",
+            "odd custom label",
+        ]
+
+        for case_index in range(60):
+            raw_chunks = []
+            for chunk_index in range(rng.randint(6, 14)):
+                source_id = rng.randint(1, 4)
+                raw_chunks.append(
+                    {
+                        "content": f"Case {case_index} chunk {chunk_index} source {source_id} workflow settings error step",
+                        "source": f"source_{source_id}.txt",
+                        "domain_module": rng.choice(["workflow", "incident", "api", "config"]),
+                        "chunk_index": chunk_index,
+                    }
+                )
+
+            automatic_clusters = _cluster_chunks(raw_chunks)
+            ranked_chunks = []
+            for chunk_index, raw_chunk in enumerate(raw_chunks):
+                ranked_chunks.append(
+                    RankedChunk(
+                        content=raw_chunk["content"],
+                        source=raw_chunk["source"],
+                        domain_module=raw_chunk["domain_module"],
+                        chunk_index=0,
+                        cluster_id="",
+                        selection_category=rng.choice(raw_category_variants),
+                        relevance_score=round(rng.uniform(0.45, 0.99), 3),
+                        relevance_reason="Stress test synthetic chunk.",
+                    )
+                )
+
+            output = RetrievalOutput(
+                chunks_ranked=ranked_chunks,
+                gaps=[],
+                relevance_score=0.7,
+                summary="stress",
+            )
+            processed = _postprocess_retrieval_output(
+                query="How do I configure and troubleshoot this workflow step by step?",
+                query_type_hint=rng.choice(query_types),
+                raw_chunks=raw_chunks,
+                output=output,
+                automatic_clusters=automatic_clusters,
+            )
+
+            original_identities = {
+                (chunk["source"], chunk["chunk_index"], chunk["content"][:160])
+                for chunk in raw_chunks
+            }
+            processed_identities = {
+                (chunk.source, chunk.chunk_index, chunk.content[:160])
+                for chunk in processed.chunks_ranked
+            }
+
+            assert len(processed.chunks_ranked) == len(raw_chunks)
+            assert processed_identities == original_identities
+            assert len(processed_identities) == len(processed.chunks_ranked)
+            assert all(chunk.cluster_id.startswith("cluster_") for chunk in processed.chunks_ranked)
+            assert all(" " not in chunk.selection_category.strip() for chunk in processed.chunks_ranked)
+            assert all(chunk.chunk_index >= 0 for chunk in processed.chunks_ranked)
+            top_window = processed.chunks_ranked[: min(SELECTION_CONTEXT_LIMIT, len(processed.chunks_ranked))]
+            assert len({(chunk.source, chunk.chunk_index) for chunk in top_window}) == len(top_window)

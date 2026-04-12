@@ -9,7 +9,7 @@ The system is organized as a directed graph where each node performs a distinct 
 The runtime implementation lives under:
 
 - `src/cag/graph/` -- graph assembly, node functions, conditional routing, shared state
-- `src/cag/agents/` -- retrieval agent (evidence ranking) and reasoning agent (answer generation)
+- `src/cag/agents/` -- retrieval agent (evidence ranking and context selection) and reasoning agent (answer generation)
 - `src/cag/eval/` -- benchmark harness for comparing CAG against RAG baselines
 
 
@@ -19,8 +19,8 @@ CAG uses the word "cognitive" in the specific sense of **meta-cognition**: the s
 
 | Node | Meta-cognitive role | What it evaluates |
 |---|---|---|
-| **ENTRY** | Context comprehension | What kind of question is this? What scope does it have? What retrieval strategy fits best? |
-| **RETRIEVE + REFINE** | Self-assessment of evidence quality | Is what I found good enough to answer? Are there gaps? Should I even proceed? |
+| **ENTRY** | Context comprehension | What kind of question is this? What scope does it have? What retrieval strategy fits best? What language does the user speak? |
+| **RETRIEVE + SELECT_CONTEXT** | Self-assessment of evidence quality and context selection | Is what I found good enough to answer? Which chunks are most useful together? Are there gaps? Should I even proceed? |
 | **REASON** | Conditioned generation | Given the evidence I judged sufficient, what answer can I safely construct? |
 | **VALIDATE** | Meta-validation | Did I produce a grounded answer? Is the hallucination risk acceptable? Should I retry or escalate? |
 
@@ -40,7 +40,7 @@ retrieve -> generate
 CAG replaces this with a control loop:
 
 ```
-ENTRY -> RETRIEVE -> REFINE -> REASON -> VALIDATE -> EXIT
+ENTRY -> RETRIEVE -> SELECT_CONTEXT (rank + select context) -> REASON -> VALIDATE -> EXIT
 ```
 
 This is worth examining in more detail, because advanced RAG implementations exist that add reranking, guardrails, and output filtering. The distinction is not about feature count. It is about **where the intelligence lives**.
@@ -51,7 +51,7 @@ In CAG, the orchestration is not a thin wrapper around vector search. It is part
 
 1. **Classification before retrieval.** The ENTRY node inspects the query and decides what type it is (GENERAL, PROCEDURAL, DIAGNOSTIC, CONFIGURATION) and what scope it has (domain, personal, consultative). This classification directly controls the retrieval strategy, the number of chunks fetched, and how query variants are constructed.
 
-2. **Evidence quality gates generation.** After retrieval and refinement, the system explicitly asks: is this evidence good enough to answer? If not, it skips REASON entirely and goes straight to VALIDATE with no answer, which triggers escalation. Generation is conditioned on evidence quality, not performed unconditionally.
+2. **Evidence quality and context selection gate generation.** After retrieval, the SELECT_CONTEXT node scores each chunk, clusters them, assigns semantic categories, and selects the best context through diversity-aware reordering. Then the system explicitly asks: is this evidence good enough to answer? If not, it skips REASON entirely and goes straight to VALIDATE with no answer, which triggers escalation. Generation is conditioned on both evidence quality and context selection, not performed unconditionally.
 
 3. **Retry with awareness.** When REASON produces an answer but VALIDATE detects high hallucination risk, the system can send the query back through REASON (up to a configured maximum of 2 retries). This is not blind repetition -- each retry increments a counter that eventually forces escalation.
 
@@ -68,15 +68,15 @@ The graph is assembled in `src/cag/graph/graph.py` using LangGraph's `StateGraph
 START
   |
   v
- ENTRY -- classify query type, scope, strategy
+ ENTRY -- classify query type, scope, strategy, detect language
   |
   v
  RETRIEVE -- fetch chunks with strategy-aware k and query variants
   |
   v
- REFINE -- rank chunks, compute relevance, identify gaps
+ SELECT_CONTEXT -- rank chunks, select best context (diversity + category), compute relevance, identify gaps
   |
-  +-- reasonable evidence --> REASON
+  +-- reasonable evidence --> REASON  <-- receives top-6 context-selected chunks
   |                            |
   |                            v
   |                          VALIDATE
@@ -94,9 +94,9 @@ START
 
 Two conditional edges control the flow:
 
-**`route_after_refine`** (REFINE -> REASON or VALIDATE)
+**`route_after_select_context`** (SELECT_CONTEXT -> REASON or VALIDATE)
 
-After REFINE scores the evidence, the system checks `_has_reasonable_evidence()`. If evidence is reasonable, the graph proceeds to REASON. If not, it skips REASON entirely and goes directly to VALIDATE with an empty answer -- which will trigger escalation.
+After SELECT_CONTEXT ranks chunks, performs context selection, and scores the evidence, the system checks `_has_reasonable_evidence()`. If evidence is reasonable, the graph proceeds to REASON with the top-6 context-selected chunks. If not, it skips REASON entirely and goes directly to VALIDATE with an empty answer -- which will trigger escalation.
 
 **`route_after_validate`** (VALIDATE -> EXIT or REASON)
 
@@ -141,6 +141,32 @@ The only condition that triggers a retry (as opposed to an escalation or normal 
 When this condition holds, the graph routes back to REASON. The retry counter increments on each REASON invocation. Once the counter exceeds the maximum, any subsequent high hallucination risk triggers escalation instead.
 
 
+## Language Detection
+
+The ENTRY node detects the language of each query using `langdetect` (`_infer_response_language` in `src/cag/graph/nodes.py`). The detected language is stored in the `response_language` field of the shared state as an ISO 639-1 code (e.g., `en`, `it`, `fr`, `de`, `es`).
+
+This language code propagates through the entire pipeline:
+
+1. **ReasoningAgent** receives `RESPONSE LANGUAGE: {code}` in its prompt, which instructs the LLM to answer in the detected language.
+2. **VALIDATE** and **EXIT** nodes use `_localized_message()` to produce error messages and escalation notices in the user's language. Messages are available for English, Italian, French, German, Spanish, and Portuguese, with English as the fallback.
+3. **Error fallback** in the ReasoningAgent also produces localized error messages based on the detected language.
+
+If `langdetect` cannot determine the language (e.g., very short queries), the system defaults to English.
+
+
+## Runtime Configuration
+
+CAG supports per-request runtime overrides via `RuntimeConfig` (`src/cag/graph/runtime.py`). This allows callers to adjust thresholds without modifying global settings:
+
+| Parameter | Default | Description |
+|---|---|---|
+| `relevance_threshold` | 0.7 | Minimum relevance score to consider evidence reasonable |
+| `confidence_threshold` | 0.6 | Minimum confidence for a valid answer |
+| `hallucination_threshold` | 0.3 | Maximum acceptable hallucination risk |
+
+Runtime config is passed to `run_query()` and stored in the shared state. All node functions read thresholds from the state rather than from global settings, ensuring that per-request overrides are respected throughout the graph execution.
+
+
 ## Query Classification
 
 ### Query Types
@@ -179,6 +205,56 @@ RETRIEVE does not use a single query string. It constructs up to 3 query variant
 Each variant is run against the vector store independently. The first variant uses the full `per_query_k`; subsequent variants use half that value (minimum 4). Results are deduplicated by (filename, chunk_index, content prefix) and sorted by keyword overlap with the original query.
 
 
+## Context Selection
+
+After the retrieval agent ranks chunks by relevance, CAG performs a **context selection** step (`_reorder_for_context_selection` in `src/cag/agents/retrieval_agent.py`). This is not a simple top-k truncation. It reorders the ranked chunks to maximize the information value of the limited context window that gets passed to the ReasoningAgent.
+
+### Why Context Selection Exists
+
+A naive approach would pass the top-N chunks by relevance score directly to the reasoning agent. But this creates two problems:
+
+1. **Redundancy.** The top chunks often overlap heavily -- they cover the same information from the same source. Passing redundant chunks wastes context window budget without adding information.
+2. **Category imbalance.** For a procedural query, the most relevant chunks might all be about prerequisites, while the actual step-by-step procedure is ranked slightly lower. Without category awareness, the answer will miss critical information.
+
+Context selection solves both problems by choosing which chunks to include and in what order, respecting a limit of `SELECTION_CONTEXT_LIMIT` (6 chunks by default).
+
+### How It Works
+
+The selection algorithm uses a greedy scoring function that evaluates each remaining chunk against the chunks already selected:
+
+**Score = relevance + category_priority + diversity + overlap_bonus + type_bonus - penalties**
+
+| Factor | What it does |
+|---|---|
+| **Relevance score** | Base signal: `chunk.relevance_score * 100`. Higher relevance chunks are preferred. |
+| **Category priority** | Each query type has a prioritized list of semantic categories. For PROCEDURAL queries, `ordered_steps` and `navigation` get the highest priority. For DIAGNOSTIC, `symptoms`, `error_causes`, `checks`, and `resolution` are prioritized. |
+| **Cluster diversity** | A bonus (+6.0 for focused queries, +2.5 for GENERAL) for selecting a chunk from a cluster that is not yet represented in the selected set. Repeated clusters are penalized (-4.0 per occurrence). |
+| **Category diversity** | A bonus for selecting a chunk with a category not yet in the selected set. Repeated categories are penalized. |
+| **Source penalty** | Slight penalty (-1.5 for focused queries, -0.5 for GENERAL) for repeating the same source document, to encourage cross-source evidence. |
+| **Query overlap bonus** | `+2.0 * keyword_overlap(query, chunk)`. Chunks that share keywords with the original query get a boost. |
+| **Near-duplicate penalty** | If a candidate chunk has keyword overlap >= 0.72 with any already-selected chunk, it receives a penalty of `-5.0 * similarity`. This prevents passing near-identical chunks to the reasoning agent. |
+| **Type-specific bonuses** | PROCEDURAL queries get +6.0 for `ordered_steps`/`navigation` categories and a bonus for earlier chunk indices. DIAGNOSTIC and CONFIGURATION queries get +4.0 for their respective priority categories. |
+| **Weaker new source penalty** | For GENERAL queries, introducing a new source that has lower relevance than the best already-selected chunk is penalized heavily (`-50.0 * relevance_gap`), preventing low-quality diversity. |
+
+The algorithm iterates greedily: at each step, it picks the chunk with the highest combined score from the remaining pool and adds it to the selected set. This produces an ordered list that balances relevance, diversity, and query-type-specific information needs.
+
+### Chunk Clustering
+
+Before ranking, chunks are grouped into automatic clusters (`_cluster_chunks`). Two chunks are assigned to the same cluster if they share at least 2 keywords or share a source document and at least 1 keyword. These clusters are used by the diversity scoring during context selection.
+
+### Semantic Categories
+
+The retrieval agent assigns each chunk a `selection_category` -- a short semantic label like `ordered_steps`, `prerequisites`, `error_causes`, `settings`, etc. These categories are normalized through `CATEGORY_ALIASES` (e.g., "steps", "step", "procedure" all map to `ordered_steps`) and used to prioritize chunks that match the query type's information needs.
+
+### Context Selection Budget
+
+The ReasoningAgent receives at most the top `SELECTION_CONTEXT_LIMIT` (6) chunks from the context-selected list. The limit is enforced in `run_reasoning_agent` (`ranked_chunks[:6]`). This budget ensures the reasoning prompt stays focused and avoids diluting the signal with marginally relevant evidence.
+
+### cag_no_selection Baseline
+
+The evaluation harness includes a `cag_no_selection` system (`_run_cag_no_selection_query` in `src/cag/eval/systems.py`) that runs the full CAG pipeline but bypasses context selection. After REFINE, the ranked chunks are reordered back to their raw retrieval order via `_restore_raw_chunk_order`. This baseline exists to isolate the contribution of context selection to answer quality in benchmark comparisons. When comparing `cag` vs `cag_no_selection`, the difference in scores measures the specific impact of the context selection step.
+
+
 ## Worked Examples
 
 ### Example 1: Success Path
@@ -198,7 +274,7 @@ RETRIEVE
   k           = 10 per variant (semantic strategy, default k)
   result      = 10 deduplicated chunks about notification configuration
 
-REFINE
+SELECT_CONTEXT
   top chunk score  = 0.88  (strong match on notification module configuration)
   gaps             = []    (no missing information detected)
   relevance_score  = 0.82  (overall evidence quality is high)
@@ -221,7 +297,7 @@ VALIDATE
 
 EXIT
   Delivers the generated answer with 3 citations.
-  Node trace: ENTRY -> RETRIEVE -> REFINE -> REASON(retry=0) -> VALIDATE -> EXIT
+  Node trace: ENTRY -> RETRIEVE -> SELECT_CONTEXT -> REASON(retry=0) -> VALIDATE -> EXIT
 ```
 
 ### Example 2: Escalation Path
@@ -240,7 +316,7 @@ RETRIEVE
   k           = 10 per variant
   result      = 10 chunks, none about pricing (documentation does not cover this topic)
 
-REFINE
+SELECT_CONTEXT
   top chunk score  = 0.22  (best match is tangential, perhaps mentioning "enterprise" in
                             an unrelated context)
   gaps             = ["pricing information", "enterprise plan details"]
@@ -265,7 +341,7 @@ EXIT
      Human review or additional source material is required.
      Please route this question to a human reviewer or provide additional
      supporting documents."
-  Node trace: ENTRY -> RETRIEVE -> REFINE -> VALIDATE -> EXIT
+  Node trace: ENTRY -> RETRIEVE -> SELECT_CONTEXT -> VALIDATE -> EXIT
 ```
 
 ### Example 3: Retry Path
@@ -282,7 +358,7 @@ RETRIEVE
   k           = 14 per variant (multi_evidence strategy, default + 4)
   result      = 14 chunks about invoice errors and rejection handling
 
-REFINE
+SELECT_CONTEXT
   top chunk score  = 0.71
   relevance_score  = 0.65
   routing          -> REASON  (top score 0.71 >= threshold 0.7)
@@ -311,7 +387,7 @@ VALIDATE
 
 EXIT
   Delivers the second answer with citations.
-  Node trace: ENTRY -> RETRIEVE -> REFINE -> REASON(retry=0) -> VALIDATE
+  Node trace: ENTRY -> RETRIEVE -> SELECT_CONTEXT -> REASON(retry=0) -> VALIDATE
               -> REASON(retry=1) -> VALIDATE -> EXIT
 ```
 
@@ -334,7 +410,10 @@ The goal is not to prove a general theorem. It is to provide a reproducible expe
 **What is already solid:**
 
 - Graph-driven orchestration with conditional routing and retry logic
-- Evaluation harness for comparing CAG against RAG baselines
+- Context selection with diversity-aware chunk ordering and category prioritization
+- Automatic language detection (55+ languages via langdetect) with localized messages
+- Runtime configuration for per-request threshold overrides
+- Evaluation harness with `cag_no_selection` baseline for isolating context selection impact
 - Generic document-oriented positioning (no domain-specific assumptions)
 - React frontend and FastAPI backend for interactive testing
 - Configurable thresholds (relevance, confidence, hallucination, max retries)

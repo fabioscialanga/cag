@@ -7,7 +7,7 @@ from pydantic import BaseModel, Field
 
 
 QueryType = Literal["GENERAL", "PROCEDURAL", "DIAGNOSTIC", "CONFIGURATION"]
-SystemName = Literal["cag", "rag_baseline", "direct_baseline", "lightrag_baseline"]
+SystemName = Literal["cag", "cag_no_selection", "rag_baseline", "direct_baseline", "lightrag_baseline"]
 JudgeMode = Literal["auto", "off", "required"]
 
 
@@ -33,10 +33,16 @@ class SystemOutput(BaseModel):
     system: SystemName
     answer: str
     citations: list[CitationRecord] = Field(default_factory=list)
+    selected_context_sources: list[str] = Field(default_factory=list)
     query_type: str = "GENERAL"
     confidence: float = 0.0
     hallucination_risk: float = 1.0
     should_escalate: bool = False
+    fallback_used: bool = False
+    fallback_reason: str | None = None
+    retrieved_chunk_count: int = 0
+    selected_chunk_count: int = 0
+    context_precision_score: float | None = None
     latency_ms: float = 0.0
     cost_estimate: float = 0.0
     node_trace: list[str] = Field(default_factory=list)
@@ -72,6 +78,7 @@ class AggregateMetrics(BaseModel):
     grounded_answer_score: float = 0.0
     point_coverage: float = 0.0
     source_grounding: float = 0.0
+    context_precision_score: float | None = None
     hallucination_rate: float = 0.0
     escalation_precision: float | None = None
     false_escalation_rate: float = 0.0

@@ -1,5 +1,19 @@
 # Benchmark Results: CAG vs RAG Baseline
 
+This file documents the original preview-stage benchmark snapshot.
+
+The evaluation harness has since evolved to support a stronger context-selection claim with:
+
+- `context_precision_score`
+- `retrieved_chunk_count` and `selected_chunk_count`
+- `cag_no_selection` as an ablation between `cag` and `rag_baseline`
+
+Use the newer triplet comparison flow when you want to measure whether context selection itself improves answer quality:
+
+```powershell
+.\run_eval_triplet.ps1
+```
+
 Date: 2026-04-08
 Model: gpt-4o
 Embedding: text-embedding-3-small

@@ -12,6 +12,9 @@ class RankedChunk(BaseModel):
     content: str = Field(description="Chunk text")
     source: str = Field(description="Source file or page")
     domain_module: str = Field(description="Derived domain/module label", default="general")
+    chunk_index: int = Field(description="Chunk position within the source document", default=0)
+    cluster_id: str = Field(description="Automatic cluster identifier used during context selection", default="cluster_1")
+    selection_category: str = Field(description="LLM-generated semantic category for this chunk", default="general")
     relevance_score: float = Field(description="Relevance score from 0 to 1", ge=0.0, le=1.0)
     relevance_reason: str = Field(description="Short explanation for the score")
 
@@ -30,6 +33,11 @@ class RetrievalOutput(BaseModel):
         le=1.0,
     )
     summary: str = Field(description="Short summary of the retrieved evidence")
+    fallback_used: bool = Field(description="Whether the retrieval agent returned a fallback response", default=False)
+    fallback_reason: str | None = Field(
+        description="Stable machine-readable reason for fallback output",
+        default=None,
+    )
 
 
 class Citation(BaseModel):
@@ -58,4 +66,9 @@ class ReasoningOutput(BaseModel):
     hallucination_reason: str = Field(
         description="Explanation for the hallucination risk estimate",
         default="",
+    )
+    fallback_used: bool = Field(description="Whether the reasoning agent returned a fallback response", default=False)
+    fallback_reason: str | None = Field(
+        description="Stable machine-readable reason for fallback output",
+        default=None,
     )

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import gc
 import json
+import shutil
 import tempfile
+import time
 import uuid
 from contextlib import AbstractContextManager
 from importlib.resources import files
@@ -77,19 +79,41 @@ def load_selected_documents(
     return documents
 
 
+def cleanup_temp_path(path: str | Path | None, retries: int = 5, delay_seconds: float = 0.25) -> None:
+    if path is None:
+        return
+
+    target = Path(path)
+    if not target.exists():
+        return
+
+    for attempt in range(retries):
+        try:
+            if target.is_dir():
+                shutil.rmtree(target)
+            else:
+                target.unlink()
+            return
+        except Exception:
+            if attempt == retries - 1:
+                return
+            gc.collect()
+            time.sleep(delay_seconds)
+
+
 class BenchmarkVectorIndex(AbstractContextManager["BenchmarkVectorIndex"]):
     def __init__(self, data_dir: str | Path, benchmark_items: list[BenchmarkItem]):
         self.data_dir = Path(data_dir)
         self.benchmark_items = benchmark_items
         self.allowed_sources = collect_benchmark_sources(benchmark_items)
-        self._tempdir: tempfile.TemporaryDirectory[str] | None = None
+        self._tempdir_path: Path | None = None
         self.vector_store = None
         self.chunks: list[Document] = []
 
     def build(self) -> "BenchmarkVectorIndex":
         from langchain_community.vectorstores import Chroma
 
-        self._tempdir = tempfile.TemporaryDirectory(prefix="cag_eval_")
+        self._tempdir_path = Path(tempfile.mkdtemp(prefix="cag_eval_"))
         documents = load_selected_documents(self.data_dir, set(self.allowed_sources))
         self.chunks = chunk_documents(documents)
 
@@ -97,7 +121,7 @@ class BenchmarkVectorIndex(AbstractContextManager["BenchmarkVectorIndex"]):
         self.vector_store = Chroma(
             collection_name=f"cag_eval_{uuid.uuid4().hex[:8]}",
             embedding_function=embeddings,
-            persist_directory=self._tempdir.name,
+            persist_directory=str(self._tempdir_path),
         )
         self.vector_store.add_documents(self.chunks)
         return self
@@ -110,12 +134,9 @@ class BenchmarkVectorIndex(AbstractContextManager["BenchmarkVectorIndex"]):
     def close(self) -> None:
         self.vector_store = None
         gc.collect()
-        if self._tempdir is not None:
-            try:
-                self._tempdir.cleanup()
-            except Exception:
-                pass
-            self._tempdir = None
+        if self._tempdir_path is not None:
+            cleanup_temp_path(self._tempdir_path)
+            self._tempdir_path = None
 
     def __exit__(self, exc_type, exc_val, exc_tb) -> None:
         self.close()

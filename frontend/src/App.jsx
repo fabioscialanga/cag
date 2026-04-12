@@ -8,9 +8,55 @@ const starterPrompts = [
 
 const operatingSignals = [
   { label: 'Stack', value: 'React + FastAPI' },
-  { label: 'Engine', value: 'CAG v0.1' },
+  { label: 'Engine', value: 'CAG v0.2' },
   { label: 'Scope', value: 'Knowledge Workspace' },
 ]
+
+function getApiBaseUrl() {
+  const configuredBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim()
+  if (configuredBaseUrl) {
+    return configuredBaseUrl.replace(/\/+$/, '')
+  }
+
+  if (typeof window === 'undefined') {
+    return 'http://localhost:8000'
+  }
+
+  const { protocol, hostname, port } = window.location
+  // Vite dev server uses ports in the 5173–5179 range; always proxy to FastAPI on 8000
+  const isViteDev = port >= '5173' && port <= '5179'
+  if (isViteDev) {
+    return `${protocol}//${hostname}:8000`
+  }
+
+  return `${protocol}//${hostname}:${port || '8000'}`
+}
+
+const apiBaseUrl = getApiBaseUrl()
+
+function getPreviewApiKey() {
+  const configuredApiKey = import.meta.env.VITE_CAG_API_KEY?.trim()
+  if (configuredApiKey) {
+    return configuredApiKey
+  }
+
+  if (typeof window === 'undefined') {
+    return ''
+  }
+
+  try {
+    return window.localStorage.getItem('CAG_API_KEY')?.trim() || ''
+  } catch {
+    return ''
+  }
+}
+
+function buildApiHeaders(extraHeaders = {}) {
+  const apiKey = getPreviewApiKey()
+  return apiKey
+    ? { ...extraHeaders, 'X-API-Key': apiKey }
+    : extraHeaders
+}
 
 function formatPercentage(value) {
   if (typeof value !== 'number' || Number.isNaN(value)) {
@@ -31,24 +77,29 @@ function basename(path) {
 function UploadPanel({ lastUpload, onUpload }) {
   const inputRef = useRef(null)
   const [uploadMsg, setUploadMsg] = useState('')
-  const [selectedFiles, setSelectedFiles] = useState([])
+  const [accruedFiles, setAccruedFiles] = useState([])
   const [isUploading, setIsUploading] = useState(false)
 
   const handleSelection = (event) => {
-    const files = Array.from(event.target.files || [])
-    setSelectedFiles(files.map((file) => file.name))
+    const incoming = Array.from(event.target.files || [])
+    setAccruedFiles((prev) => {
+      const existingNames = new Set(prev.map((f) => f.name))
+      const fresh = incoming.filter((f) => !existingNames.has(f.name))
+      return [...prev, ...fresh]
+    })
+    // Reset native input so the same file can be re-added later if removed
+    event.target.value = ''
+  }
+
+  const removeFile = (name) => {
+    setAccruedFiles((prev) => prev.filter((f) => f.name !== name))
   }
 
   const handleUpload = async () => {
-    const files = inputRef.current?.files
-
-    if (!files || files.length === 0 || isUploading) {
-      return
-    }
+    if (accruedFiles.length === 0 || isUploading) return
 
     const form = new FormData()
-
-    for (const file of files) {
+    for (const file of accruedFiles) {
       form.append('files', file)
     }
 
@@ -56,12 +107,14 @@ function UploadPanel({ lastUpload, onUpload }) {
     setUploadMsg('Indexing is starting...')
 
     try {
-      const response = await fetch('http://localhost:8000/upload?ingest=true', {
+      const response = await fetch(`${apiBaseUrl}/upload?ingest=true`, {
         method: 'POST',
         body: form,
+        headers: buildApiHeaders(),
       })
       const data = await response.json()
       setUploadMsg(JSON.stringify(data, null, 2))
+      setAccruedFiles([])
       onUpload?.(data)
     } catch (error) {
       setUploadMsg(`Upload failed: ${String(error)}`)
@@ -88,21 +141,29 @@ function UploadPanel({ lastUpload, onUpload }) {
           ref={inputRef}
           type="file"
           multiple
+          accept=".pdf,.txt,.md"
           onChange={handleSelection}
         />
-        <span className="file-picker__button">Choose documents</span>
+        <span className="file-picker__button">Add documents</span>
         <span className="file-picker__meta">
-          {selectedFiles.length > 0
-            ? `${selectedFiles.length} files ready`
-            : 'PDF, TXT, and reference material'}
+          {accruedFiles.length > 0
+            ? `${accruedFiles.length} file${accruedFiles.length > 1 ? 's' : ''} queued — add more or upload`
+            : 'PDF, TXT, MD — hold Ctrl (or ⌘) to select multiple'}
         </span>
       </label>
 
-      {selectedFiles.length > 0 && (
+      {accruedFiles.length > 0 && (
         <div className="file-tags">
-          {selectedFiles.map((fileName) => (
-            <span key={fileName} className="file-tag">
-              {fileName}
+          {accruedFiles.map((file) => (
+            <span key={file.name} className="file-tag">
+              {file.name}
+              <button
+                className="file-tag__remove"
+                onClick={() => removeFile(file.name)}
+                title="Remove"
+              >
+                ✕
+              </button>
             </span>
           ))}
         </div>
@@ -111,9 +172,11 @@ function UploadPanel({ lastUpload, onUpload }) {
       <button
         className="button button--primary"
         onClick={handleUpload}
-        disabled={isUploading}
+        disabled={isUploading || accruedFiles.length === 0}
       >
-        {isUploading ? 'Indexing...' : 'Upload and ingest'}
+        {isUploading
+          ? 'Indexing...'
+          : `Upload and ingest${accruedFiles.length > 0 ? ` (${accruedFiles.length})` : ''}`}
       </button>
 
       <div className="mini-stats">
@@ -143,7 +206,13 @@ function UploadPanel({ lastUpload, onUpload }) {
   )
 }
 
-function IntelligencePanel({ lastResult, lastUpload }) {
+function formatSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
+}
+
+function IntelligencePanel({ lastResult, kbFiles, onDeleteFile }) {
   const citations = Array.isArray(lastResult?.citations) ? lastResult.citations : []
 
   return (
@@ -155,8 +224,8 @@ function IntelligencePanel({ lastResult, lastUpload }) {
 
       <div className="insight-grid">
         <div className="insight-card">
-          <span>Saved documents</span>
-          <strong>{Array.isArray(lastUpload?.saved) ? lastUpload.saved.length : 0}</strong>
+          <span>Documents indexed</span>
+          <strong>{kbFiles.length}</strong>
         </div>
         <div className="insight-card">
           <span>Confidence</span>
@@ -171,6 +240,26 @@ function IntelligencePanel({ lastResult, lastUpload }) {
           <strong>{lastResult?.query_type || 'Waiting'}</strong>
         </div>
       </div>
+
+      {kbFiles.length > 0 && (
+        <div className="kb-file-list">
+          <span className="kb-file-list__label">Knowledge base</span>
+          {kbFiles.map((file) => (
+            <div key={file.name} className="kb-file-item">
+              <span className="upload-list__dot" />
+              <span className="kb-file-item__name" title={file.name}>{file.name}</span>
+              <span className="kb-file-item__size">{formatSize(file.size_bytes)}</span>
+              <button
+                className="kb-file-item__delete"
+                title="Delete document"
+                onClick={() => onDeleteFile(file.name)}
+              >
+                🗑
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div className="insight-note">
         <span className="insight-note__label">Response status</span>
@@ -225,9 +314,9 @@ function ChatPanel({ onResult }) {
     setIsSending(true)
 
     try {
-      const response = await fetch('http://localhost:8000/query', {
+      const response = await fetch(`${apiBaseUrl}/query`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: buildApiHeaders({ 'Content-Type': 'application/json' }),
         body: JSON.stringify({
           query: trimmed,
           conversation_history: nextConversation.map((message) => ({
@@ -412,6 +501,48 @@ function ChatPanel({ onResult }) {
 export default function App() {
   const [lastUpload, setLastUpload] = useState(null)
   const [lastResult, setLastResult] = useState(null)
+  const [kbFiles, setKbFiles] = useState([])
+
+  const refreshKbFiles = async () => {
+    try {
+      const response = await fetch(`${apiBaseUrl}/files`, {
+        headers: buildApiHeaders(),
+      })
+      if (response.ok) {
+        const data = await response.json()
+        setKbFiles(data.files || [])
+      }
+    } catch {
+      // API not yet available, silently ignore
+    }
+  }
+
+  useEffect(() => {
+    refreshKbFiles()
+  }, [])
+
+  const handleUpload = (data) => {
+    setLastUpload(data)
+    refreshKbFiles()
+  }
+
+  const handleDeleteFile = async (name) => {
+    if (!window.confirm(`Delete "${name}" from the knowledge base?\nThis will re-index all remaining documents.`)) return
+    try {
+      const response = await fetch(`${apiBaseUrl}/files/${encodeURIComponent(name)}`, {
+        method: 'DELETE',
+        headers: buildApiHeaders(),
+      })
+      if (response.ok) {
+        await refreshKbFiles()
+      } else {
+        const err = await response.json()
+        window.alert(`Delete failed: ${err.detail || response.status}`)
+      }
+    } catch (error) {
+      window.alert(`Delete failed: ${String(error)}`)
+    }
+  }
 
   return (
     <div className="app-shell">
@@ -462,8 +593,8 @@ export default function App() {
 
       <main className="layout">
         <aside className="sidebar-stack">
-          <UploadPanel lastUpload={lastUpload} onUpload={setLastUpload} />
-          <IntelligencePanel lastUpload={lastUpload} lastResult={lastResult} />
+          <UploadPanel lastUpload={lastUpload} onUpload={handleUpload} />
+          <IntelligencePanel lastResult={lastResult} kbFiles={kbFiles} onDeleteFile={handleDeleteFile} />
         </aside>
 
         <ChatPanel onResult={setLastResult} />

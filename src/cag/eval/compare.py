@@ -80,9 +80,16 @@ def _collapse_results_by_question(results: list[ScoredResult]) -> list[ScoredRes
                     "grounded_answer_score": mean(item.grounded_answer_score for item in items),
                     "point_coverage": mean(item.point_coverage for item in items),
                     "source_grounding": mean(item.source_grounding for item in items),
+                    "context_precision_score": (
+                        mean(valid)
+                        if (valid := [item.context_precision_score for item in items if item.context_precision_score is not None])
+                        else None
+                    ),
                     "unsupported_claim_score": mean(item.unsupported_claim_score for item in items),
                     "confidence": mean(item.confidence for item in items),
                     "hallucination_risk": mean(item.hallucination_risk for item in items),
+                    "retrieved_chunk_count": round(mean(item.retrieved_chunk_count for item in items)),
+                    "selected_chunk_count": round(mean(item.selected_chunk_count for item in items)),
                     "latency_ms": mean(item.latency_ms for item in items),
                     "cost_estimate": mean(item.cost_estimate for item in items),
                     "task_success": mean(1.0 if item.task_success else 0.0 for item in items) >= 0.5,
@@ -111,6 +118,7 @@ def _aggregate_metrics(manifests: list[RunManifest]) -> AggregateMetrics:
         grounded_answer_score=mean(metric.grounded_answer_score for metric in metrics_list),
         point_coverage=mean(metric.point_coverage for metric in metrics_list),
         source_grounding=mean(metric.source_grounding for metric in metrics_list),
+        context_precision_score=maybe_mean([metric.context_precision_score for metric in metrics_list]),
         hallucination_rate=mean(metric.hallucination_rate for metric in metrics_list),
         escalation_precision=maybe_mean([metric.escalation_precision for metric in metrics_list]),
         false_escalation_rate=mean(metric.false_escalation_rate for metric in metrics_list),
@@ -261,6 +269,35 @@ def _representative_failures(results: list[ScoredResult], limit: int = 5) -> lis
     return sorted(results, key=lambda item: item.grounded_answer_score)[:limit]
 
 
+def _delta_vs_baseline(metrics_by_system: dict[str, AggregateMetrics], baseline_system: str = "rag_baseline") -> dict[str, dict[str, float | None]]:
+    baseline = metrics_by_system.get(baseline_system)
+    if baseline is None:
+        return {}
+
+    metric_names = [
+        "grounded_answer_score",
+        "context_precision_score",
+        "hallucination_rate",
+        "task_success_rate",
+        "avg_latency_ms",
+        "avg_cost_estimate",
+    ]
+    deltas: dict[str, dict[str, float | None]] = {}
+    for system, metrics in metrics_by_system.items():
+        if system == baseline_system:
+            continue
+        system_delta: dict[str, float | None] = {}
+        for metric_name in metric_names:
+            system_value = getattr(metrics, metric_name)
+            baseline_value = getattr(baseline, metric_name)
+            if system_value is None or baseline_value is None:
+                system_delta[metric_name] = None
+            else:
+                system_delta[metric_name] = float(system_value - baseline_value)
+        deltas[system] = system_delta
+    return deltas
+
+
 def _build_markdown(
     manifests: list[RunManifest],
     results_by_system: dict[str, list[ScoredResult]],
@@ -268,6 +305,7 @@ def _build_markdown(
     run_counts_by_system: dict[str, int] | None = None,
 ) -> str:
     metrics_by_system = {manifest.system: manifest.metrics for manifest in manifests}
+    deltas_vs_rag = _delta_vs_baseline(metrics_by_system)
     lines = [
         "# CAG Benchmark Comparison",
         "",
@@ -275,8 +313,8 @@ def _build_markdown(
         "",
         "## Aggregate Metrics",
         "",
-        "| System | Runs | Grounded Answer | Hallucination Rate | Task Success | Escalation Precision | False Escalation | Avg Latency (ms) | Avg Cost |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| System | Runs | Grounded Answer | Context Precision | Hallucination Rate | Task Success | Escalation Precision | False Escalation | Avg Latency (ms) | Avg Cost |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
 
     for manifest in manifests:
@@ -288,6 +326,7 @@ def _build_markdown(
                     manifest.system,
                     str((run_counts_by_system or {}).get(manifest.system, 1)),
                     _format_metric(metrics.grounded_answer_score),
+                    _format_metric(metrics.context_precision_score),
                     _format_metric(metrics.hallucination_rate),
                     _format_metric(metrics.task_success_rate),
                     _format_metric(metrics.escalation_precision),
@@ -299,16 +338,38 @@ def _build_markdown(
             + " |"
         )
 
+    if deltas_vs_rag:
+        lines.extend(["", "## Delta vs RAG Baseline", ""])
+        lines.append("| System | Grounded Answer | Context Precision | Hallucination Rate | Task Success | Avg Latency (ms) | Avg Cost |")
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+        for system, metrics in sorted(deltas_vs_rag.items()):
+            lines.append(
+                "| "
+                + " | ".join(
+                    [
+                        system,
+                        _format_metric(metrics["grounded_answer_score"]),
+                        _format_metric(metrics["context_precision_score"]),
+                        _format_metric(metrics["hallucination_rate"]),
+                        _format_metric(metrics["task_success_rate"]),
+                        _format_metric(metrics["avg_latency_ms"]),
+                        _format_metric(metrics["avg_cost_estimate"]),
+                    ]
+                )
+                + " |"
+            )
+
     lines.extend(["", "## By Query Type", ""])
     for manifest in manifests:
         lines.append(f"### {manifest.system}")
         lines.append("")
-        lines.append("| Query Type | Grounded Answer | Task Success | Hallucination Rate |")
-        lines.append("| --- | ---: | ---: | ---: |")
+        lines.append("| Query Type | Grounded Answer | Context Precision | Task Success | Hallucination Rate |")
+        lines.append("| --- | ---: | ---: | ---: | ---: |")
         for query_type, metrics in manifest.by_query_type.items():
             lines.append(
                 f"| {query_type} | {_format_metric(metrics.grounded_answer_score)} | "
-                f"{_format_metric(metrics.task_success_rate)} | {_format_metric(metrics.hallucination_rate)} |"
+                f"{_format_metric(metrics.context_precision_score)} | {_format_metric(metrics.task_success_rate)} | "
+                f"{_format_metric(metrics.hallucination_rate)} |"
             )
         lines.append("")
 
@@ -415,6 +476,7 @@ def main(argv=None) -> None:
         "systems": [manifest.system for manifest in manifests],
         "run_counts_by_system": run_counts_by_system,
         "metrics_by_system": {manifest.system: manifest.metrics.model_dump(mode="json") for manifest in manifests},
+        "delta_vs_rag_baseline": _delta_vs_baseline({manifest.system: manifest.metrics for manifest in manifests}),
         "claim_verdict": _verdict_text(
             {manifest.system: manifest.metrics for manifest in manifests},
             statistical_test,
