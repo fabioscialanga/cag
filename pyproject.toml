@@ -42,6 +42,7 @@ dev = [
     "pytest>=8.0.0",
     "fastapi>=0.95.0",
     "python-multipart>=0.0.6",
+    "build>=1.2.0",
 ]
 eval = [
     "scipy>=1.12.0",

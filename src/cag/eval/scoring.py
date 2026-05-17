@@ -77,6 +77,21 @@ def context_precision_score(selected_context_sources: list[str], gold_sources: l
     return matched / len(selected_context_sources)
 
 
+def context_recall_score(selected_context_sources: list[str], gold_sources: list[str], answerable: bool) -> float | None:
+    if not answerable:
+        return None
+
+    expected_sources = {_basename(source) for source in gold_sources}
+    if not expected_sources:
+        return 0.0
+
+    selected_sources = {_basename(source) for source in selected_context_sources if source}
+    if not selected_sources:
+        return 0.0
+
+    return len(selected_sources & expected_sources) / len(expected_sources)
+
+
 def fallback_judge(item: BenchmarkItem, result: SystemOutput, coverage: float, grounding: float) -> JudgeVerdict:
     if not item.answerable:
         if result.should_escalate:
@@ -109,6 +124,7 @@ def score_result(item: BenchmarkItem, result: SystemOutput, judge=None) -> Score
     coverage = point_coverage(result.answer, item.gold_answer_points)
     grounding = source_grounding_score(result.citations, item.gold_sources)
     context_precision = context_precision_score(result.selected_context_sources, item.gold_sources, item.answerable)
+    context_recall = context_recall_score(result.selected_context_sources, item.gold_sources, item.answerable)
     verdict = judge.evaluate(item, result) if judge else fallback_judge(item, result, coverage, grounding)
     base_payload = result.model_dump(exclude={"context_precision_score"})
 
@@ -151,6 +167,7 @@ def score_result(item: BenchmarkItem, result: SystemOutput, judge=None) -> Score
         point_coverage=coverage,
         source_grounding=grounding,
         context_precision_score=context_precision,
+        context_recall_score=context_recall,
         unsupported_claim_score=verdict.unsupported_claims,
         grounded_answer_score=min(1.0, grounded_score),
         task_success=task_success,
@@ -176,12 +193,18 @@ def aggregate_results(results: list[ScoredResult]) -> AggregateMetrics:
         for result in answerable
         if result.context_precision_score is not None
     ]
+    context_recall_values = [
+        result.context_recall_score
+        for result in answerable
+        if result.context_recall_score is not None
+    ]
 
     return AggregateMetrics(
         grounded_answer_score=mean(result.grounded_answer_score for result in results),
         point_coverage=mean(result.point_coverage for result in answerable) if answerable else 0.0,
         source_grounding=mean(result.source_grounding for result in answerable) if answerable else 0.0,
         context_precision_score=mean(context_precision_values) if context_precision_values else None,
+        context_recall_score=mean(context_recall_values) if context_recall_values else None,
         hallucination_rate=mean(1.0 if result.hallucination_flag else 0.0 for result in results),
         escalation_precision=(len(correct_escalations) / len(escalations) if escalations else None),
         false_escalation_rate=(len(false_escalations) / len(answerable) if answerable else 0.0),

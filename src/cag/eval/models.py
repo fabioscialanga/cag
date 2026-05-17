@@ -7,7 +7,16 @@ from pydantic import BaseModel, Field
 
 
 QueryType = Literal["GENERAL", "PROCEDURAL", "DIAGNOSTIC", "CONFIGURATION"]
-SystemName = Literal["cag", "cag_no_selection", "rag_baseline", "direct_baseline", "lightrag_baseline"]
+SystemName = Literal[
+    "cag",
+    "cag_compiled",
+    "compiled_only",
+    "compiled_plus_raw",
+    "cag_no_selection",
+    "rag_baseline",
+    "direct_baseline",
+    "lightrag_baseline",
+]
 JudgeMode = Literal["auto", "off", "required"]
 
 
@@ -42,6 +51,7 @@ class SystemOutput(BaseModel):
     fallback_reason: str | None = None
     retrieved_chunk_count: int = 0
     selected_chunk_count: int = 0
+    compiled_chunk_count: int = 0
     context_precision_score: float | None = None
     latency_ms: float = 0.0
     cost_estimate: float = 0.0
@@ -66,6 +76,7 @@ class ScoredResult(SystemOutput):
     source_grounding: float = 0.0
     unsupported_claim_score: float = 1.0
     grounded_answer_score: float = 0.0
+    context_recall_score: float | None = None
     task_success: bool = False
     escalation_correct: bool = False
     hallucination_flag: bool = False
@@ -79,6 +90,7 @@ class AggregateMetrics(BaseModel):
     point_coverage: float = 0.0
     source_grounding: float = 0.0
     context_precision_score: float | None = None
+    context_recall_score: float | None = None
     hallucination_rate: float = 0.0
     escalation_precision: float | None = None
     false_escalation_rate: float = 0.0

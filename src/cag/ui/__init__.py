@@ -1,1 +1,1 @@
-"""CAG v0.1 - UI Package"""
+"""CAG UI package."""

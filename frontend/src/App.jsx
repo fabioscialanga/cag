@@ -6,11 +6,41 @@ const starterPrompts = [
   'Help me troubleshoot an issue using the available knowledge base.',
 ]
 
-const operatingSignals = [
-  { label: 'Stack', value: 'React + FastAPI' },
-  { label: 'Engine', value: 'CAG v0.2' },
-  { label: 'Scope', value: 'Knowledge Workspace' },
-]
+const graphNodes = ['ENTRY', 'RETRIEVE', 'SELECT', 'REASON', 'POST', 'VALIDATE']
+
+function normalizeTraceNode(node) {
+  const value = String(node || '').toUpperCase()
+  if (value.startsWith('SELECT_CONTEXT')) return 'SELECT'
+  if (value.startsWith('REASON')) return 'REASON'
+  if (value.startsWith('POST_GROUNDING')) return 'POST'
+  if (value.startsWith('CONVERSATION_TRANSFORM')) return 'TRANSFORM'
+  return value
+}
+
+function buildGraphFlow(result, progress) {
+  if (progress?.status === 'running') {
+    const activeIndex = Math.max(0, graphNodes.indexOf(progress.activeStage))
+    return graphNodes.map((stage, index) => ({
+      label: stage,
+      state: index < activeIndex ? 'done' : index === activeIndex ? 'active' : 'pending',
+    }))
+  }
+
+  const trace = Array.isArray(result?.node_trace)
+    ? result.node_trace.map(normalizeTraceNode)
+    : []
+  const stages = trace.includes('TRANSFORM') ? ['TRANSFORM'] : graphNodes
+  const visited = new Set(trace)
+  const landedStage = [...trace].reverse().find((node) => stages.includes(node))
+
+  return stages.map((stage) => {
+    let state = 'pending'
+    if (visited.has(stage)) {
+      state = stage === landedStage ? 'active' : 'done'
+    }
+    return { label: stage, state }
+  })
+}
 
 function getApiBaseUrl() {
   const configuredBaseUrl = import.meta.env.VITE_API_BASE_URL?.trim()
@@ -23,10 +53,10 @@ function getApiBaseUrl() {
   }
 
   const { protocol, hostname, port } = window.location
-  // Vite dev server uses ports in the 5173–5179 range; always proxy to FastAPI on 8000
+  // Vite dev server uses ports in the 5173-5179 range; proxy to the current FastAPI backend on 8010.
   const isViteDev = port >= '5173' && port <= '5179'
   if (isViteDev) {
-    return `${protocol}//${hostname}:8000`
+    return `${protocol}//${hostname}:8010`
   }
 
   return `${protocol}//${hostname}:${port || '8000'}`
@@ -66,6 +96,49 @@ function formatPercentage(value) {
   return `${Math.round(value * 100)}%`
 }
 
+function percentageValue(value) {
+  if (typeof value !== 'number' || Number.isNaN(value)) {
+    return 0
+  }
+  return Math.max(0, Math.min(100, Math.round(value * 100)))
+}
+
+function getRunVerdict(result, progress) {
+  if (progress?.status === 'running') {
+    return {
+      label: 'Running',
+      tone: 'running',
+      detail: 'CAG is moving through retrieval, selection, reasoning, and validation.',
+    }
+  }
+  if (!result?.answer) {
+    return {
+      label: 'Ready',
+      tone: 'ready',
+      detail: 'Load evidence or ask a question to inspect the graph path.',
+    }
+  }
+  if (result.should_escalate) {
+    return {
+      label: 'Escalation',
+      tone: 'danger',
+      detail: 'The answer needs human review or stronger source material.',
+    }
+  }
+  if (result.query_type === 'CONVERSATION_TRANSFORM') {
+    return {
+      label: 'Transformed',
+      tone: 'transform',
+      detail: 'CAG handled the request as conversation work, without document retrieval.',
+    }
+  }
+  return {
+    label: 'Answered',
+    tone: 'success',
+    detail: 'The answer is available with telemetry and evidence inspection.',
+  }
+}
+
 function basename(path) {
   if (!path) {
     return ''
@@ -74,11 +147,118 @@ function basename(path) {
   return String(path).split(/[\\/]/).pop()
 }
 
-function UploadPanel({ lastUpload, onUpload }) {
+function isIngestActive(status) {
+  return status?.status === 'queued' || status?.status === 'running'
+}
+
+function ingestPercent(status) {
+  return Math.round(Math.max(0, Math.min(1, Number(status?.progress) || 0)) * 100)
+}
+
+function truncateText(text, limit = 180) {
+  const value = String(text || '').replace(/\s+/g, ' ').trim()
+  if (value.length <= limit) {
+    return value
+  }
+  return `${value.slice(0, limit - 1)}...`
+}
+
+function normalizeChunks(chunks) {
+  return Array.isArray(chunks) ? chunks : []
+}
+
+function RunConsole({ result, progress, graphFlow }) {
+  const verdict = getRunVerdict(result, progress)
+  const confidence = percentageValue(result?.confidence)
+  const risk = percentageValue(result?.hallucination_risk)
+  const trace = Array.isArray(result?.node_trace) ? result.node_trace : []
+  const plan = result?.retrieval_plan && typeof result.retrieval_plan === 'object'
+    ? result.retrieval_plan
+    : null
+  const intent = result?.intent && typeof result.intent === 'object'
+    ? result.intent
+    : null
+  const activeStage = graphFlow.find((stage) => stage.state === 'active')?.label
+    || graphFlow.filter((stage) => stage.state === 'done').at(-1)?.label
+    || 'Waiting'
+
+  return (
+    <aside className="run-console" aria-label="Current run status">
+      <div className="run-console__topline">
+        <span className={`run-verdict run-verdict--${verdict.tone}`}>
+          <span className="run-verdict__dot" aria-hidden="true" />
+          {verdict.label}
+        </span>
+        <span className="run-console__api">{apiBaseUrl.replace(/^https?:\/\//, '')}</span>
+      </div>
+
+      <div>
+        <span className="run-console__label">Current stage</span>
+        <strong className="run-console__stage">{activeStage}</strong>
+        <p>{verdict.detail}</p>
+      </div>
+
+      <div className="run-bars">
+        <div className="run-bar">
+          <div className="run-bar__label">
+            <span>Confidence</span>
+            <strong>{formatPercentage(result?.confidence)}</strong>
+          </div>
+          <span className="run-bar__track">
+            <span className="run-bar__fill run-bar__fill--confidence" style={{ width: `${confidence}%` }} />
+          </span>
+        </div>
+        <div className="run-bar">
+          <div className="run-bar__label">
+            <span>Risk</span>
+            <strong>{formatPercentage(result?.hallucination_risk)}</strong>
+          </div>
+          <span className="run-bar__track">
+            <span className="run-bar__fill run-bar__fill--risk" style={{ width: `${risk}%` }} />
+          </span>
+        </div>
+      </div>
+
+      <div className="run-console__facts">
+        <div>
+          <span>Type</span>
+          <strong>{result?.query_type || 'GENERAL'}</strong>
+        </div>
+        <div>
+          <span>Trace</span>
+          <strong>{trace.length || 0} nodes</strong>
+        </div>
+        <div>
+          <span>Sources</span>
+          <strong>{Array.isArray(result?.citations) ? result.citations.length : 0}</strong>
+        </div>
+      </div>
+
+      <div className="run-console__plan">
+        <div>
+          <span>Plan</span>
+          <strong>{plan?.strategy || 'semantic'}</strong>
+        </div>
+        <div>
+          <span>Grounding</span>
+          <strong>{result?.post_grounding_status || 'pending'}</strong>
+        </div>
+        <div>
+          <span>Scope</span>
+          <strong>{intent?.question_scope || 'domain'}</strong>
+        </div>
+      </div>
+    </aside>
+  )
+}
+
+function UploadPanel({ lastUpload, ingestStatus, onUpload, onResetAll }) {
   const inputRef = useRef(null)
   const [uploadMsg, setUploadMsg] = useState('')
   const [accruedFiles, setAccruedFiles] = useState([])
   const [isUploading, setIsUploading] = useState(false)
+  const [isLoadingDemo, setIsLoadingDemo] = useState(false)
+  const [isResetting, setIsResetting] = useState(false)
 
   const handleSelection = (event) => {
     const incoming = Array.from(event.target.files || [])
@@ -113,7 +293,7 @@ function UploadPanel({ lastUpload, onUpload }) {
         headers: buildApiHeaders(),
       })
       const data = await response.json()
-      setUploadMsg(JSON.stringify(data, null, 2))
+      setUploadMsg(`${data.saved?.length || 0} file(s) saved. Ingestion queued.`)
       setAccruedFiles([])
       onUpload?.(data)
     } catch (error) {
@@ -123,16 +303,64 @@ function UploadPanel({ lastUpload, onUpload }) {
     }
   }
 
+  const handleDemoReset = async () => {
+    if (isLoadingDemo) return
+
+    setIsLoadingDemo(true)
+    setUploadMsg('Loading demo corpus...')
+
+    try {
+      const response = await fetch(`${apiBaseUrl}/demo/reset?ingest=true`, {
+        method: 'POST',
+        headers: buildApiHeaders(),
+      })
+      const data = await response.json()
+      if (!response.ok) {
+        throw new Error(data.detail || `HTTP ${response.status}`)
+      }
+      setUploadMsg(`${data.copied?.length || 0} demo file(s) loaded. Ingestion queued.`)
+      onUpload?.({ saved: data.copied || [], ingest_started: data.ingest_started })
+    } catch (error) {
+      setUploadMsg(`Demo load failed: ${String(error)}`)
+    } finally {
+      setIsLoadingDemo(false)
+    }
+  }
+
+  const handleResetAll = async () => {
+    if (isResetting || isUploading || isLoadingDemo) return
+    const confirmed = window.confirm(
+      'Reset everything?\n\nThis deletes uploaded documents, document profiles, the knowledge graph, and vector index data.'
+    )
+    if (!confirmed) return
+
+    setIsResetting(true)
+    setUploadMsg('Resetting knowledge base...')
+
+    try {
+      const data = await onResetAll?.()
+      setAccruedFiles([])
+      setUploadMsg(
+        `Workspace reset. Deleted ${data.deleted_files?.length || 0} file(s); knowledge ${
+          data.knowledge_deleted ? 'cleared' : 'already empty'
+        }.`
+      )
+    } catch (error) {
+      setUploadMsg(`Reset failed: ${String(error)}`)
+    } finally {
+      setIsResetting(false)
+    }
+  }
+
   const savedFiles = Array.isArray(lastUpload?.saved) ? lastUpload.saved : []
 
   return (
     <section className="surface upload-panel">
       <div className="panel-heading">
-        <p className="eyebrow">Knowledge Intake</p>
-        <h2>Add new documents to the knowledge base</h2>
+        <p className="eyebrow">Intake</p>
+        <h2>Source documents</h2>
         <p className="panel-copy">
-          Select files, internal notes, or reference material and start
-          background ingestion right away.
+          Add PDFs, markdown, or text files and rebuild the evidence index for this session.
         </p>
       </div>
 
@@ -144,11 +372,11 @@ function UploadPanel({ lastUpload, onUpload }) {
           accept=".pdf,.txt,.md"
           onChange={handleSelection}
         />
-        <span className="file-picker__button">Add documents</span>
+        <span className="file-picker__button">Choose files</span>
         <span className="file-picker__meta">
           {accruedFiles.length > 0
-            ? `${accruedFiles.length} file${accruedFiles.length > 1 ? 's' : ''} queued — add more or upload`
-            : 'PDF, TXT, MD — hold Ctrl (or ⌘) to select multiple'}
+            ? `${accruedFiles.length} file${accruedFiles.length > 1 ? 's' : ''} queued`
+            : 'PDF, TXT, MD up to the API limits'}
         </span>
       </label>
 
@@ -162,7 +390,7 @@ function UploadPanel({ lastUpload, onUpload }) {
                 onClick={() => removeFile(file.name)}
                 title="Remove"
               >
-                ✕
+                x
               </button>
             </span>
           ))}
@@ -176,17 +404,33 @@ function UploadPanel({ lastUpload, onUpload }) {
       >
         {isUploading
           ? 'Indexing...'
-          : `Upload and ingest${accruedFiles.length > 0 ? ` (${accruedFiles.length})` : ''}`}
+          : `Upload${accruedFiles.length > 0 ? ` ${accruedFiles.length}` : ''}`}
+      </button>
+
+      <button
+        className="button button--secondary demo-loader"
+        onClick={handleDemoReset}
+        disabled={isLoadingDemo || isUploading || isResetting}
+      >
+        {isLoadingDemo ? 'Loading demo...' : 'Load demo'}
+      </button>
+
+      <button
+        className="button button--danger reset-all"
+        onClick={handleResetAll}
+        disabled={isResetting || isUploading || isLoadingDemo}
+      >
+        {isResetting ? 'Resetting...' : 'Reset workspace'}
       </button>
 
       <div className="mini-stats">
         <div className="mini-stat">
-          <span>Latest batch</span>
+          <span>Batch</span>
           <strong>{savedFiles.length || 0} files</strong>
         </div>
         <div className="mini-stat">
           <span>Pipeline</span>
-          <strong>{lastUpload?.ingest_started ? 'Running' : 'Ready'}</strong>
+          <strong>{isIngestActive(ingestStatus) ? 'Running' : ingestStatus?.status || 'Ready'}</strong>
         </div>
       </div>
 
@@ -212,38 +456,76 @@ function formatSize(bytes) {
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`
 }
 
-function IntelligencePanel({ lastResult, kbFiles, onDeleteFile }) {
+function IntelligencePanel({ lastResult, kbFiles, documentProfiles, onDeleteFile }) {
   const citations = Array.isArray(lastResult?.citations) ? lastResult.citations : []
+  const llmProfiles = documentProfiles.filter((profile) => profile.generator === 'llm').length
 
   return (
     <section className="surface intelligence-panel">
       <div className="panel-heading">
-        <p className="eyebrow">Session Pulse</p>
-        <h2>Operational signals</h2>
+        <p className="eyebrow">Telemetry</p>
+        <h2>Run signals</h2>
       </div>
 
       <div className="insight-grid">
         <div className="insight-card">
-          <span>Documents indexed</span>
-          <strong>{kbFiles.length}</strong>
+          <span>Profiles</span>
+          <strong>{documentProfiles.length || kbFiles.length}</strong>
         </div>
         <div className="insight-card">
           <span>Confidence</span>
           <strong>{formatPercentage(lastResult?.confidence)}</strong>
         </div>
         <div className="insight-card">
-          <span>Hallucination risk</span>
+          <span>Risk</span>
           <strong>{formatPercentage(lastResult?.hallucination_risk)}</strong>
         </div>
         <div className="insight-card">
-          <span>Query type</span>
+          <span>Type</span>
           <strong>{lastResult?.query_type || 'Waiting'}</strong>
         </div>
       </div>
 
+      <div className="document-dashboard">
+        <div className="document-dashboard__header">
+          <span className="kb-file-list__label">Document intelligence</span>
+          <span>{llmProfiles}/{documentProfiles.length || 0} LLM</span>
+        </div>
+        {documentProfiles.length === 0 ? (
+          <p className="evidence-muted">
+            Upload documents to inspect summaries, topics, keywords, and covered intents.
+          </p>
+        ) : (
+          <div className="document-profile-list">
+            {documentProfiles.slice(0, 6).map((profile) => (
+              <article key={profile.profile_id} className="document-profile-card">
+                <div className="document-profile-card__topline">
+                  <strong title={profile.filename}>{profile.filename}</strong>
+                  <span>{profile.generator}</span>
+                </div>
+                <p>{truncateText(profile.summary, 180)}</p>
+                <div className="document-profile-card__meta">
+                  <span>{profile.chunk_count || 0} chunks</span>
+                  {(profile.topics || []).slice(0, 3).map((topic) => (
+                    <span key={topic}>{topic}</span>
+                  ))}
+                </div>
+                {(profile.keywords || []).length > 0 && (
+                  <div className="document-profile-card__keywords">
+                    {(profile.keywords || []).slice(0, 5).map((keyword) => (
+                      <span key={keyword}>{keyword}</span>
+                    ))}
+                  </div>
+                )}
+              </article>
+            ))}
+          </div>
+        )}
+      </div>
+
       {kbFiles.length > 0 && (
         <div className="kb-file-list">
-          <span className="kb-file-list__label">Knowledge base</span>
+          <span className="kb-file-list__label">Indexed files</span>
           {kbFiles.map((file) => (
             <div key={file.name} className="kb-file-item">
               <span className="upload-list__dot" />
@@ -254,7 +536,7 @@ function IntelligencePanel({ lastResult, kbFiles, onDeleteFile }) {
                 title="Delete document"
                 onClick={() => onDeleteFile(file.name)}
               >
-                🗑
+                Delete
               </button>
             </div>
           ))}
@@ -265,8 +547,8 @@ function IntelligencePanel({ lastResult, kbFiles, onDeleteFile }) {
         <span className="insight-note__label">Response status</span>
         <p>
           {lastResult?.should_escalate
-            ? 'The pipeline suggests escalation to a specialist.'
-            : 'The session is ready for questions, exploration, and troubleshooting.'}
+            ? 'CAG recommends escalation because the evidence is not strong enough.'
+            : 'Ready for grounded questions, trace inspection, and retrieval checks.'}
         </p>
       </div>
 
@@ -284,7 +566,165 @@ function IntelligencePanel({ lastResult, kbFiles, onDeleteFile }) {
   )
 }
 
-function ChatPanel({ onResult }) {
+function IngestStatusBanner({ status }) {
+  if (!status || status.status === 'idle') {
+    return null
+  }
+
+  const isProblem = status.status === 'failed'
+  const steps = Array.isArray(status.steps) ? status.steps : []
+  const percent = ingestPercent(status)
+  const stageLabel = String(status.stage || status.status || '').replace(/_/g, ' ')
+  const counters = [
+    ['Files', status.files_total],
+    ['Docs', status.documents_loaded],
+    ['Chunks', status.chunks_created || status.chunks_indexed],
+    ['Claims', status.claims_created],
+    ['Vectors', status.vectors_indexed],
+  ]
+
+  return (
+    <div className={`ingest-banner ${isProblem ? 'ingest-banner--problem' : ''}`}>
+      <div className="ingest-banner__header">
+        <div>
+          <strong>{isProblem ? 'Ingestion failed' : `Ingestion ${status.status}`}</strong>
+          <span className="ingest-banner__stage">{stageLabel}</span>
+        </div>
+        <span className="ingest-banner__percent">{percent}%</span>
+      </div>
+
+      <div className="ingest-banner__progress" aria-hidden="true">
+        <span style={{ width: `${percent}%` }} />
+      </div>
+
+      <div className="ingest-banner__meta">
+        {counters.map(([label, value]) => (
+          <div key={label}>
+            <span>{label}</span>
+            <strong>{Number(value) || 0}</strong>
+          </div>
+        ))}
+      </div>
+
+      {steps.length > 0 && (
+        <div className="ingest-banner__steps">
+          {steps.map((step) => (
+            <div key={step.id} className={`ingest-step ingest-step--${step.status}`}>
+              <span className="ingest-step__dot" aria-hidden="true" />
+              <span>{step.label}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      <span className="ingest-banner__message">
+        {status.message || `${status.chunks_indexed || 0} chunks indexed`}
+      </span>
+    </div>
+  )
+}
+
+function EvidencePanel({ result }) {
+  const retrieved = normalizeChunks(result?.chunks)
+  const selected = normalizeChunks(result?.ranked_chunks).slice(0, 6)
+  const documentCandidates = Array.isArray(result?.document_candidates) ? result.document_candidates : []
+  const gaps = Array.isArray(result?.gaps) ? result.gaps : []
+  const hasEvidence = retrieved.length > 0 || selected.length > 0 || documentCandidates.length > 0 || gaps.length > 0
+
+  return (
+    <section className="evidence-panel">
+      <div className="evidence-panel__header">
+        <div>
+          <span className="meta-panel__label">Evidence workbench</span>
+          <h3>Selected evidence</h3>
+        </div>
+        <div className="evidence-counters">
+          <span>{retrieved.length} retrieved</span>
+          <span>{selected.length} selected</span>
+          <span>{documentCandidates.length} docs</span>
+          <span>{gaps.length} gaps</span>
+        </div>
+      </div>
+
+      {!hasEvidence ? (
+        <div className="evidence-empty">
+          Ask a question to inspect retrieved chunks, selected context, and evidence gaps.
+        </div>
+      ) : (
+        <div className="evidence-grid">
+          <div className="evidence-column">
+            <span className="evidence-column__label">Selected context</span>
+            {selected.length === 0 ? (
+              <p className="evidence-muted">No selected context yet.</p>
+            ) : (
+              selected.map((chunk, index) => (
+                <article key={`${chunk.source || 'selected'}-${chunk.chunk_index ?? index}`} className="evidence-card">
+                  <div className="evidence-card__topline">
+                    <strong>{basename(chunk.source) || 'Unknown source'}</strong>
+                    <span>{formatPercentage(chunk.relevance_score)}</span>
+                  </div>
+                  <p>{truncateText(chunk.content)}</p>
+                  <div className="evidence-card__meta">
+                    <span>{chunk.selection_category || 'general'}</span>
+                    {chunk.compiled_knowledge && <span>compiled</span>}
+                  </div>
+                </article>
+              ))
+            )}
+          </div>
+
+          <div className="evidence-column">
+            <span className="evidence-column__label">Document Map</span>
+            {documentCandidates.length === 0 ? (
+              <p className="evidence-muted">No document candidates reported.</p>
+            ) : (
+              <div className="document-candidate-list">
+                {documentCandidates.slice(0, 5).map((candidate, index) => (
+                  <article key={`${candidate.profile_id || candidate.filename || 'candidate'}-${index}`} className="document-candidate-card">
+                    <div className="evidence-card__topline">
+                      <strong>{basename(candidate.filename || candidate.source) || 'Unknown document'}</strong>
+                      <span>{Number(candidate.score || 0).toFixed(1)}</span>
+                    </div>
+                    <p>{candidate.match_reason || truncateText(candidate.summary, 140)}</p>
+                    <div className="evidence-card__meta">
+                      <span>{candidate.generator || 'profile'}</span>
+                      {(candidate.topics || []).slice(0, 2).map((topic) => (
+                        <span key={topic}>{topic}</span>
+                      ))}
+                    </div>
+                  </article>
+                ))}
+              </div>
+            )}
+
+            <span className="evidence-column__label">Gaps</span>
+            {gaps.length === 0 ? (
+              <p className="evidence-muted">No evidence gaps reported.</p>
+            ) : (
+              <ul className="gap-list">
+                {gaps.slice(0, 6).map((gap, index) => (
+                  <li key={`${gap}-${index}`}>{gap}</li>
+                ))}
+              </ul>
+            )}
+
+            <span className="evidence-column__label evidence-column__label--spaced">Retrieved pool</span>
+            <div className="retrieved-list">
+              {retrieved.slice(0, 6).map((chunk, index) => (
+                <div key={`${chunk.source || 'retrieved'}-${chunk.chunk_index ?? index}`} className="retrieved-row">
+                  <span>{basename(chunk.source) || 'Unknown source'}</span>
+                  <small>#{chunk.chunk_index ?? index}</small>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
+
+function ChatPanel({ onResult, onGraphProgress }) {
   const listRef = useRef(null)
   const [chatMessages, setChatMessages] = useState([])
   const [input, setInput] = useState('')
@@ -312,6 +752,14 @@ function ChatPanel({ onResult }) {
     setChatMessages(nextConversation)
     setInput('')
     setIsSending(true)
+    onGraphProgress?.({ status: 'running', activeStage: 'ENTRY' })
+    const progressTimers = [
+      window.setTimeout(() => onGraphProgress?.({ status: 'running', activeStage: 'RETRIEVE' }), 350),
+      window.setTimeout(() => onGraphProgress?.({ status: 'running', activeStage: 'SELECT' }), 950),
+      window.setTimeout(() => onGraphProgress?.({ status: 'running', activeStage: 'REASON' }), 1650),
+      window.setTimeout(() => onGraphProgress?.({ status: 'running', activeStage: 'POST' }), 2300),
+      window.setTimeout(() => onGraphProgress?.({ status: 'running', activeStage: 'VALIDATE' }), 3000),
+    ]
 
     try {
       const response = await fetch(`${apiBaseUrl}/query`, {
@@ -348,6 +796,8 @@ function ChatPanel({ onResult }) {
       setLatestMeta(null)
       onResult?.(null)
     } finally {
+      progressTimers.forEach((timer) => window.clearTimeout(timer))
+      onGraphProgress?.(null)
       setIsSending(false)
     }
   }
@@ -356,24 +806,30 @@ function ChatPanel({ onResult }) {
     setChatMessages([])
     setLatestMeta(null)
     onResult?.(null)
+    onGraphProgress?.(null)
   }
 
   const citations = Array.isArray(latestMeta?.citations) ? latestMeta.citations : []
   const nodeTrace = Array.isArray(latestMeta?.node_trace) ? latestMeta.node_trace : []
+  const suggestedActions = Array.isArray(latestMeta?.suggested_actions) ? latestMeta.suggested_actions : []
+  const groundingChecks = Array.isArray(latestMeta?.grounding_checks) ? latestMeta.grounding_checks : []
+  const retrievalPlan = latestMeta?.retrieval_plan && typeof latestMeta.retrieval_plan === 'object'
+    ? latestMeta.retrieval_plan
+    : null
 
   return (
     <section className="surface chat-panel">
       <div className="chat-panel__header">
         <div>
-          <p className="eyebrow">Conversation Studio</p>
-          <h2>Talk with your knowledge assistant</h2>
+          <p className="eyebrow">Query</p>
+          <h2>Ask CAG</h2>
           <p className="panel-copy">
-            Multi-turn chat with reliability signals and document-aware context.
+            Send questions through the graph and inspect the answer, confidence, risk, and sources.
           </p>
         </div>
 
         <button className="button button--secondary" onClick={resetConversation}>
-          New session
+          Clear
         </button>
       </div>
 
@@ -381,10 +837,9 @@ function ChatPanel({ onResult }) {
         {chatMessages.length === 0 ? (
           <div className="empty-state">
             <span className="empty-state__badge">Ready</span>
-            <h3>Start with a clear request.</h3>
+            <h3>Start with a grounded request.</h3>
             <p>
-              Search your uploaded content, extract the key steps, or investigate
-              a problem using the available context.
+              Search uploaded content, extract procedures, or investigate a problem using the indexed evidence.
             </p>
             <div className="prompt-grid">
               {starterPrompts.map((prompt) => (
@@ -405,7 +860,7 @@ function ChatPanel({ onResult }) {
               className={`message-card message-card--${message.role}`}
             >
               <span className="message-card__role">
-                {message.role === 'user' ? 'Operator' : 'Assistant'}
+                {message.role === 'user' ? 'You' : 'CAG'}
               </span>
               <p>{message.content}</p>
             </article>
@@ -413,9 +868,14 @@ function ChatPanel({ onResult }) {
         )}
 
         {isSending && (
-          <article className="message-card message-card--assistant">
-            <span className="message-card__role">Assistant</span>
-            <p>I am analyzing the context, retrieval path, and best response...</p>
+          <article className="message-card message-card--assistant message-card--thinking">
+            <span className="message-card__role">CAG</span>
+            <p>Analyzing query type, retrieval path, selected context, and validation state...</p>
+            <span className="thinking-meter" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
           </article>
         )}
       </div>
@@ -430,7 +890,7 @@ function ChatPanel({ onResult }) {
               sendMessage()
             }
           }}
-          placeholder="Ask a question about your documents, workflow, or knowledge base..."
+          placeholder="Ask about your documents, procedures, incidents, or configuration..."
           rows={1}
         />
         <button
@@ -438,7 +898,7 @@ function ChatPanel({ onResult }) {
           onClick={() => sendMessage()}
           disabled={isSending}
         >
-          {isSending ? 'Sending...' : 'Send'}
+          {isSending ? 'Running...' : 'Run'}
         </button>
       </div>
 
@@ -448,21 +908,74 @@ function ChatPanel({ onResult }) {
           <strong>{formatPercentage(latestMeta?.confidence)}</strong>
         </div>
         <div className="metric-pill">
-          <span>Hallucination risk</span>
+          <span>Risk</span>
           <strong>{formatPercentage(latestMeta?.hallucination_risk)}</strong>
         </div>
         <div className="metric-pill">
-          <span>Query type</span>
+          <span>Type</span>
           <strong>{latestMeta?.query_type || 'Waiting'}</strong>
         </div>
         <div className="metric-pill">
-          <span>Escalation</span>
+          <span>Escalate</span>
           <strong>{latestMeta?.should_escalate ? 'Suggested' : 'No'}</strong>
+        </div>
+        <div className="metric-pill">
+          <span>Grounding</span>
+          <strong>{latestMeta?.post_grounding_status || 'Waiting'}</strong>
+        </div>
+        <div className="metric-pill">
+          <span>Plan</span>
+          <strong>{retrievalPlan?.strategy || 'Waiting'}</strong>
         </div>
       </div>
 
-      {(nodeTrace.length > 0 || citations.length > 0) && (
+      {suggestedActions.length > 0 && (
+        <div className="action-strip" aria-label="Suggested next actions">
+          {suggestedActions.map((action) => (
+            <button
+              key={action.id || action.label}
+              className="action-chip"
+              type="button"
+              title={action.reason || ''}
+              onClick={() => {
+                if (action.prompt) {
+                  setInput(action.prompt)
+                }
+              }}
+            >
+              <span>{action.type || 'action'}</span>
+              {action.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {(nodeTrace.length > 0 || citations.length > 0 || retrievalPlan || groundingChecks.length > 0) && (
         <div className="meta-panel">
+          {retrievalPlan && (
+            <div>
+              <span className="meta-panel__label">Modified prompt and retrieval plan</span>
+              <div className="plan-grid">
+                <div>
+                  <span>Modified</span>
+                  <strong>{latestMeta?.modified_query || latestMeta?.original_query || 'Not available'}</strong>
+                </div>
+                <div>
+                  <span>Sources</span>
+                  <strong>{(retrievalPlan.sources || []).join(', ') || 'document index'}</strong>
+                </div>
+                <div>
+                  <span>Variants</span>
+                  <strong>{(retrievalPlan.query_variants || []).length || 0}</strong>
+                </div>
+                <div>
+                  <span>Access</span>
+                  <strong>{retrievalPlan.access_filter_applied ? 'Filtered' : 'Open'}</strong>
+                </div>
+              </div>
+            </div>
+          )}
+
           {nodeTrace.length > 0 && (
             <div>
               <span className="meta-panel__label">Node trace</span>
@@ -492,8 +1005,27 @@ function ChatPanel({ onResult }) {
               </div>
             </div>
           )}
+
+          {groundingChecks.length > 0 && (
+            <div>
+              <span className="meta-panel__label">Post grounding</span>
+              <div className="grounding-list">
+                {groundingChecks.slice(0, 3).map((check, index) => (
+                  <div
+                    key={`${check.claim || 'claim'}-${index}`}
+                    className={`grounding-row ${check.supported ? 'grounding-row--supported' : 'grounding-row--weak'}`}
+                  >
+                    <span>{check.supported ? 'Supported' : 'Weak'}</span>
+                    <strong>{truncateText(check.claim, 140)}</strong>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
+
+      <EvidencePanel result={latestMeta} />
     </section>
   )
 }
@@ -502,6 +1034,10 @@ export default function App() {
   const [lastUpload, setLastUpload] = useState(null)
   const [lastResult, setLastResult] = useState(null)
   const [kbFiles, setKbFiles] = useState([])
+  const [documentProfiles, setDocumentProfiles] = useState([])
+  const [ingestStatus, setIngestStatus] = useState(null)
+  const [graphProgress, setGraphProgress] = useState(null)
+  const graphFlow = buildGraphFlow(lastResult, graphProgress)
 
   const refreshKbFiles = async () => {
     try {
@@ -517,13 +1053,60 @@ export default function App() {
     }
   }
 
+  const refreshIngestStatus = async () => {
+    try {
+      const response = await fetch(`${apiBaseUrl}/ingest/status`, {
+        headers: buildApiHeaders(),
+      })
+      if (response.ok) {
+        setIngestStatus(await response.json())
+      }
+    } catch {
+      // API not yet available, silently ignore
+    }
+  }
+
+  const refreshDocumentProfiles = async () => {
+    try {
+      const response = await fetch(`${apiBaseUrl}/document-profiles`, {
+        headers: buildApiHeaders(),
+      })
+      if (response.ok) {
+        const data = await response.json()
+        setDocumentProfiles(data.profiles || [])
+      }
+    } catch {
+      // API not yet available, silently ignore
+    }
+  }
+
   useEffect(() => {
     refreshKbFiles()
+    refreshIngestStatus()
+    refreshDocumentProfiles()
   }, [])
+
+  useEffect(() => {
+    if (!isIngestActive(ingestStatus)) {
+      return undefined
+    }
+
+    const intervalId = window.setInterval(() => {
+      refreshIngestStatus()
+      refreshKbFiles()
+      refreshDocumentProfiles()
+    }, 1200)
+
+    return () => window.clearInterval(intervalId)
+  }, [ingestStatus?.status])
 
   const handleUpload = (data) => {
     setLastUpload(data)
     refreshKbFiles()
+    refreshIngestStatus()
+    refreshDocumentProfiles()
+    window.setTimeout(refreshIngestStatus, 1500)
+    window.setTimeout(refreshDocumentProfiles, 2500)
   }
 
   const handleDeleteFile = async (name) => {
@@ -535,6 +1118,7 @@ export default function App() {
       })
       if (response.ok) {
         await refreshKbFiles()
+        await refreshDocumentProfiles()
       } else {
         const err = await response.json()
         window.alert(`Delete failed: ${err.detail || response.status}`)
@@ -544,60 +1128,86 @@ export default function App() {
     }
   }
 
+  const handleResetAll = async () => {
+    const response = await fetch(`${apiBaseUrl}/reset/all`, {
+      method: 'DELETE',
+      headers: buildApiHeaders(),
+    })
+    const data = await response.json()
+    if (!response.ok) {
+      throw new Error(data.detail || `HTTP ${response.status}`)
+    }
+    setLastUpload(null)
+    setLastResult(null)
+    setKbFiles([])
+    setDocumentProfiles([])
+    setIngestStatus({ status: 'idle', stage: 'idle', message: '', chunks_indexed: 0 })
+    return data
+  }
+
   return (
     <div className="app-shell">
       <header className="masthead">
         <div className="brand-lockup">
           <span className="brand-mark">CAG</span>
           <div>
-            <p className="eyebrow">Knowledge Intelligence Desk</p>
-            <h1>A more elegant control room for documents, research, and answers</h1>
+            <p className="eyebrow">Cognitive Augmented Generation</p>
+            <h1>Evidence workbench</h1>
           </div>
+        </div>
+        <div className="masthead-actions">
+          <span className="status-light" aria-hidden="true" />
+          <span>Local preview</span>
         </div>
       </header>
 
-      <section className="hero surface">
-        <div className="hero-copy">
-          <p className="eyebrow">Editorial Ops Interface</p>
-          <h2>
-            Upload source material, query the CAG pipeline, and read answers in a
-            workspace with stronger visual hierarchy.
-          </h2>
+      <section className="workspace-summary">
+        <div className="workspace-summary__copy">
+          <p className="eyebrow">Graph-driven document QA</p>
+          <h2>Load evidence, run a query, verify the reasoning path.</h2>
           <p>
-            The interface now follows a brighter editorial direction with warm
-            paper tones, teal accents, expressive serif typography, and panels
-            designed for long reading sessions.
+            CAG makes retrieval decisions explicit: query type, selected context,
+            validation, sources, and escalation state stay visible while you test.
           </p>
-        </div>
-
-        <div className="hero-side">
-          <div className="signal-grid">
-            {operatingSignals.map((signal) => (
-              <div key={signal.label} className="signal-card">
-                <span>{signal.label}</span>
-                <strong>{signal.value}</strong>
-              </div>
+          <div className="graph-rail" aria-label="CAG graph stages">
+            {graphFlow.map((node, index) => (
+              <React.Fragment key={node.label}>
+                <span className={`graph-node graph-node--${node.state}`}>
+                  <span className="graph-node__status" aria-hidden="true" />
+                  {node.label}
+                </span>
+                {index < graphFlow.length - 1 && (
+                  <span
+                    className={`graph-link graph-link--${node.state === 'done' ? 'done' : 'pending'}`}
+                    aria-hidden="true"
+                  />
+                )}
+              </React.Fragment>
             ))}
           </div>
-
-          <div className="hero-note">
-            <span className="hero-note__label">Latest session</span>
-            <p>
-              {lastResult?.answer
-                ? 'A response is available with telemetry and consulted sources.'
-                : 'No query has been sent yet. The console is ready for a first test.'}
-            </p>
-          </div>
         </div>
+
+        <RunConsole result={lastResult} progress={graphProgress} graphFlow={graphFlow} />
       </section>
 
       <main className="layout">
         <aside className="sidebar-stack">
-          <UploadPanel lastUpload={lastUpload} onUpload={handleUpload} />
-          <IntelligencePanel lastResult={lastResult} kbFiles={kbFiles} onDeleteFile={handleDeleteFile} />
+          <IngestStatusBanner status={ingestStatus} />
+          <UploadPanel
+            lastUpload={lastUpload}
+            ingestStatus={ingestStatus}
+            onUpload={handleUpload}
+            onResetAll={handleResetAll}
+          />
+          <IntelligencePanel
+            lastResult={lastResult}
+            kbFiles={kbFiles}
+            documentProfiles={documentProfiles}
+            onDeleteFile={handleDeleteFile}
+          />
         </aside>
 
-        <ChatPanel onResult={setLastResult} />
+        <ChatPanel onResult={setLastResult} onGraphProgress={setGraphProgress} />
       </main>
     </div>
   )

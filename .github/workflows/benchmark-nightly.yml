@@ -1,0 +1,70 @@
+name: Benchmark Nightly
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * *"
+
+jobs:
+  repeated-run-comparison:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Check benchmark secret
+        id: secret-check
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          if [ -n "$OPENAI_API_KEY" ]; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::OPENAI_API_KEY is not configured; skipping benchmark nightly."
+            echo "available=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Python
+        if: steps.secret-check.outputs.available == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        if: steps.secret-check.outputs.available == 'true'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev,eval,api]"
+
+      - name: Run repeated CAG benchmark
+        if: steps.secret-check.outputs.available == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python -m cag.eval.run --system cag --limit 10 --runs 3 --judge-mode off --output-dir artifacts/eval_runs
+
+      - name: Run repeated RAG benchmark
+        if: steps.secret-check.outputs.available == 'true'
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: python -m cag.eval.run --system rag_baseline --limit 10 --runs 3 --judge-mode off --output-dir artifacts/eval_runs
+
+      - name: Compare latest runs
+        if: steps.secret-check.outputs.available == 'true'
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from cag.eval.compare import main
+
+          runs = sorted(Path("artifacts/eval_runs").iterdir())
+          cag = [path for path in runs if path.name.endswith("_cag")][-1]
+          rag = [path for path in runs if path.name.endswith("_rag_baseline")][-1]
+          main(["--runs", str(cag), str(rag), "--output-dir", "artifacts/eval_comparisons"])
+          PY
+
+      - name: Upload benchmark artifacts
+        if: steps.secret-check.outputs.available == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-nightly
+          path: artifacts/

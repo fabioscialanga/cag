@@ -216,7 +216,7 @@ A naive approach would pass the top-N chunks by relevance score directly to the 
 1. **Redundancy.** The top chunks often overlap heavily -- they cover the same information from the same source. Passing redundant chunks wastes context window budget without adding information.
 2. **Category imbalance.** For a procedural query, the most relevant chunks might all be about prerequisites, while the actual step-by-step procedure is ranked slightly lower. Without category awareness, the answer will miss critical information.
 
-Context selection solves both problems by choosing which chunks to include and in what order, respecting a limit of `SELECTION_CONTEXT_LIMIT` (6 chunks by default).
+Context selection solves both problems by choosing which chunks to include and in what order, respecting `CONTEXT_SELECTION_LIMIT` for general questions and `COMPLEX_CONTEXT_SELECTION_LIMIT` for procedural, diagnostic, and configuration questions.
 
 ### How It Works
 
@@ -248,7 +248,7 @@ The retrieval agent assigns each chunk a `selection_category` -- a short semanti
 
 ### Context Selection Budget
 
-The ReasoningAgent receives at most the top `SELECTION_CONTEXT_LIMIT` (6) chunks from the context-selected list. The limit is enforced in `run_reasoning_agent` (`ranked_chunks[:6]`). This budget ensures the reasoning prompt stays focused and avoids diluting the signal with marginally relevant evidence.
+The ReasoningAgent receives at most `CONTEXT_SELECTION_LIMIT` chunks for general questions and `COMPLEX_CONTEXT_SELECTION_LIMIT` chunks for complex procedural, diagnostic, and configuration questions. The selected context is semantically ordered before prompting so definitions/overview, prerequisites, steps, diagnostics, and constraints appear in a useful response-building order.
 
 ### cag_no_selection Baseline
 

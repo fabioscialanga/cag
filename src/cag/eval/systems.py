@@ -5,6 +5,7 @@ import logging
 import math
 import re
 import time
+import inspect
 from typing import Callable
 
 from agno.agent import Agent
@@ -14,7 +15,7 @@ from pydantic import BaseModel, Field
 from cag.config import settings
 from cag.eval.models import CitationRecord, SystemOutput
 from cag.graph.graph import run_query
-from cag.graph.runtime import resolve_runtime_config
+from cag.graph.runtime import RuntimeConfig, resolve_runtime_config
 from cag.graph.nodes import (
     entry_node,
     exit_node,
@@ -25,6 +26,7 @@ from cag.graph.nodes import (
     route_after_validate,
     validate_node,
 )
+from cag.knowledge.compiler import compiled_search
 from cag.llm_factory import get_agno_model
 
 logger = logging.getLogger(__name__)
@@ -86,6 +88,10 @@ def _selected_context_sources(selected_context: list[dict]) -> list[str]:
     return [str(chunk.get("source", "")) for chunk in selected_context if chunk.get("source")]
 
 
+def _compiled_chunk_count(chunks: list[dict]) -> int:
+    return sum(1 for chunk in chunks if bool(chunk.get("compiled_knowledge", False)))
+
+
 def _build_initial_cag_state(query: str, conversation_history: list | None = None) -> dict:
     runtime_config = resolve_runtime_config()
     return {
@@ -104,6 +110,8 @@ def _build_initial_cag_state(query: str, conversation_history: list | None = Non
         "response_language": "en",
         "should_escalate": False,
         "should_retry_reason": False,
+        "should_retry_retrieval": False,
+        "retrieval_retry_used": False,
         "reason_retries": 0,
         "error_message": "",
         "retry_guidance": "",
@@ -114,8 +122,30 @@ def _build_initial_cag_state(query: str, conversation_history: list | None = Non
         "relevance_threshold": runtime_config.relevance_threshold,
         "confidence_threshold": runtime_config.confidence_threshold,
         "hallucination_threshold": runtime_config.hallucination_threshold,
+        "retrieval_top_k": runtime_config.retrieval_top_k,
         "search_fn": None,
     }
+
+
+def _run_query_runner(
+    query_runner: Callable[..., dict],
+    question: str,
+    search_fn: SearchFn,
+    top_k: int,
+) -> dict:
+    signature = inspect.signature(query_runner)
+    supports_runtime_config = (
+        "runtime_config" in signature.parameters
+        or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values())
+    )
+    if supports_runtime_config:
+        return query_runner(
+            question,
+            conversation_history=[],
+            search_fn=search_fn,
+            runtime_config=RuntimeConfig(retrieval_top_k=top_k),
+        )
+    return query_runner(question, conversation_history=[], search_fn=search_fn)
 
 
 def _restore_raw_chunk_order(raw_chunks: list[dict], ranked_chunks: list[dict]) -> list[dict]:
@@ -147,10 +177,13 @@ def _run_cag_no_selection_query(
     query: str,
     conversation_history: list | None = None,
     search_fn: SearchFn | None = None,
+    runtime_config: RuntimeConfig | None = None,
 ) -> dict:
     state = _build_initial_cag_state(query, conversation_history)
+    resolved_runtime = resolve_runtime_config(runtime_config)
     if search_fn is not None:
         state["search_fn"] = search_fn
+    state["retrieval_top_k"] = resolved_runtime.retrieval_top_k
     state.update(entry_node(state))
     state.update(retrieve_node(state))
 
@@ -216,7 +249,7 @@ def run_cag_system(
     retrieval_context = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
     started = time.perf_counter()
-    result = query_runner(question, conversation_history=[], search_fn=search_fn)
+    result = _run_query_runner(query_runner, question, search_fn, top_k)
     latency_ms = (time.perf_counter() - started) * 1000
 
     selected_context = _selected_context_from_state(result)
@@ -240,6 +273,7 @@ def run_cag_system(
         selected_context_sources=_selected_context_sources(selected_context),
         retrieved_chunk_count=len(final_chunks),
         selected_chunk_count=len(selected_context),
+        compiled_chunk_count=_compiled_chunk_count(final_chunks),
         latency_ms=round(latency_ms, 2),
         cost_estimate=cost_estimate,
         node_trace=[str(node) for node in result.get("node_trace", [])],
@@ -257,7 +291,7 @@ def run_cag_no_selection(
     retrieval_context = "\n\n".join(doc.page_content for doc in retrieved_docs)
 
     started = time.perf_counter()
-    result = query_runner(question, conversation_history=[], search_fn=search_fn)
+    result = _run_query_runner(query_runner, question, search_fn, top_k)
     latency_ms = (time.perf_counter() - started) * 1000
 
     selected_context = _selected_context_from_state(result)
@@ -281,10 +315,84 @@ def run_cag_no_selection(
         selected_context_sources=_selected_context_sources(selected_context),
         retrieved_chunk_count=len(final_chunks),
         selected_chunk_count=len(selected_context),
+        compiled_chunk_count=_compiled_chunk_count(final_chunks),
         latency_ms=round(latency_ms, 2),
         cost_estimate=cost_estimate,
         node_trace=[str(node) for node in result.get("node_trace", [])],
     )
+
+
+def _compiled_then_raw_search(
+    query: str,
+    k: int,
+    raw_search_fn: SearchFn,
+    knowledge_db_path=None,
+) -> list[Document]:
+    compiled_docs = compiled_search(query, k=k, db_path=knowledge_db_path)
+    if compiled_docs:
+        return compiled_docs
+    return raw_search_fn(query, k)
+
+
+def run_cag_compiled(
+    question_id: str,
+    question: str,
+    search_fn: SearchFn,
+    top_k: int,
+    query_runner: Callable[..., dict] = run_query,
+    knowledge_db_path=None,
+) -> SystemOutput:
+    def hybrid_search(query: str, k: int | None = None) -> list[Document]:
+        return _compiled_then_raw_search(query, k or top_k, search_fn, knowledge_db_path)
+
+    output = run_cag_system(question_id, question, hybrid_search, top_k, query_runner=query_runner)
+    return output.model_copy(update={"system": "cag_compiled"})
+
+
+def run_compiled_only(
+    question_id: str,
+    question: str,
+    top_k: int,
+    query_runner: Callable[..., dict] = run_query,
+    knowledge_db_path=None,
+) -> SystemOutput:
+    def search(query: str, k: int | None = None) -> list[Document]:
+        return compiled_search(query, k=k or top_k, db_path=knowledge_db_path)
+
+    output = run_cag_system(question_id, question, search, top_k, query_runner=query_runner)
+    return output.model_copy(update={"system": "compiled_only"})
+
+
+def run_compiled_plus_raw(
+    question_id: str,
+    question: str,
+    search_fn: SearchFn,
+    top_k: int,
+    query_runner: Callable[..., dict] = run_query,
+    knowledge_db_path=None,
+) -> SystemOutput:
+    def merged_search(query: str, k: int | None = None) -> list[Document]:
+        effective_k = k or top_k
+        compiled_docs = compiled_search(query, k=effective_k, db_path=knowledge_db_path)
+        raw_docs = search_fn(query, effective_k)
+        combined: list[Document] = []
+        seen: set[tuple[str, int, str]] = set()
+        for doc in [*compiled_docs, *raw_docs]:
+            key = (
+                str(doc.metadata.get("filename", doc.metadata.get("source", "N/A"))),
+                int(doc.metadata.get("chunk_index", 0)),
+                doc.page_content[:160],
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            combined.append(doc)
+            if len(combined) >= effective_k:
+                break
+        return combined
+
+    output = run_cag_system(question_id, question, merged_search, top_k, query_runner=query_runner)
+    return output.model_copy(update={"system": "compiled_plus_raw"})
 
 
 def run_rag_baseline(
@@ -417,6 +525,21 @@ def run_system(
     effective_top_k = top_k or settings.retrieval_top_k
     if system == "cag":
         return run_cag_system(question_id, question, search_fn, effective_top_k)
+    if system == "cag_compiled":
+        knowledge_db_path = None
+        if isinstance(runtime, dict):
+            knowledge_db_path = runtime.get("knowledge_db_path")
+        return run_cag_compiled(question_id, question, search_fn, effective_top_k, knowledge_db_path=knowledge_db_path)
+    if system == "compiled_only":
+        knowledge_db_path = None
+        if isinstance(runtime, dict):
+            knowledge_db_path = runtime.get("knowledge_db_path")
+        return run_compiled_only(question_id, question, effective_top_k, knowledge_db_path=knowledge_db_path)
+    if system == "compiled_plus_raw":
+        knowledge_db_path = None
+        if isinstance(runtime, dict):
+            knowledge_db_path = runtime.get("knowledge_db_path")
+        return run_compiled_plus_raw(question_id, question, search_fn, effective_top_k, knowledge_db_path=knowledge_db_path)
     if system == "cag_no_selection":
         return run_cag_no_selection(question_id, question, search_fn, effective_top_k)
     if system == "rag_baseline":

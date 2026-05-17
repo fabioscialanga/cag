@@ -1,1 +1,4 @@
 prune data/raw
+prune experiments
+prune artifacts
+prune data/chroma_db

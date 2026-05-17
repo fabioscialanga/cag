@@ -1,1 +1,1 @@
-"""CAG v0.1 - Ingestion Package"""
+"""CAG ingestion package."""

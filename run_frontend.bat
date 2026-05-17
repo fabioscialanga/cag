@@ -15,7 +15,12 @@ IF %ERRORLEVEL% NEQ 0 (
 echo Installing frontend dependencies...
 npm install
 
-echo Starting Vite dev server on http://localhost:5173 ...
-npm run dev
+echo Starting Vite dev server on http://127.0.0.1:5176 ...
+echo It will call the FastAPI backend on http://127.0.0.1:8010.
+npm run dev -- --host 127.0.0.1 --port 5176
 
 POPD
+
+echo.
+echo Frontend stopped. If this was unexpected, copy the error above.
+pause

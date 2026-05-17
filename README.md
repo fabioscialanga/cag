@@ -1,589 +1,572 @@
-# CAG
+﻿# CAG
 
 ![Status](https://img.shields.io/badge/status-preview-yellow)
 ![Version](https://img.shields.io/badge/version-0.2-blue)
 ![Python](https://img.shields.io/badge/python-3.11+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-**Cognitive Augmented Generation — graph-driven document reasoning with explicit context selection**
+**EN:** A safer RAG pipeline that selects evidence, validates answers, and refuses when docs are insufficient.  
+**IT:** Una pipeline RAG piu' sicura che seleziona evidenze, valida le risposte e rifiuta quando la documentazione non basta.
 
-CAG is a retrieval reasoning system for AI builders who want something more deliberate than plain `retrieve top-k -> generate answer`.
+## EN - What Is CAG?
 
-In one sentence: **CAG is a retrieval system that decides how to search, how to select evidence, how to reason, and when not to answer.**
+CAG is a graph-driven document QA runtime for builders who need more control than plain `retrieve -> generate`.
 
-If standard RAG treats retrieval as context assembly, CAG treats retrieval as a reasoning problem.
+Core loop:
 
-## What CAG Does
+`ENTRY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> VALIDATE -> EXIT`
 
-CAG is built around a **directed reasoning graph** where every step serves a distinct cognitive function. Before generating an answer, the system:
+Why it matters:
+- Query-type aware retrieval strategy.
+- Explicit context selection before generation.
+- Validation with confidence, hallucination risk, and escalation.
+- Better inspectability for benchmarking and debugging.
 
-1. **Classifies the query** — what type of question is this? (factual, procedural, diagnostic, configuration). The classification directly controls how retrieval is performed.
-2. **Detects the user's language** — 55+ languages via langdetect. The entire pipeline responds in the user's language.
-3. **Retrieves with strategy awareness** — different query types use different retrieval strategies and different chunk budgets. Multi-variant queries are constructed so retrieval covers more surface area.
-4. **Selects the best context** — after retrieving candidate chunks, the system clusters them, assigns semantic categories (e.g. `ordered_steps`, `error_causes`, `prerequisites`), and reorders them using a diversity-aware scoring function. Only the most informative set of chunks reaches the reasoning agent.
-5. **Reasons over selected evidence** — the reasoning agent generates an answer grounded in the selected context, not the entire raw retrieval pool.
-6. **Validates the answer** — confidence, hallucination risk, and evidence sufficiency are all checked before the answer is returned. If any check fails, the system either retries generation or escalates to a human instead of guessing.
+## EN - Core Idea
 
-The control loop is:
+The central idea behind CAG is simple and strict:
 
-```
-ENTRY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> VALIDATE -> EXIT
-```
+`Grounding quality is mostly a retrieval-orchestration problem, not only a generation problem.`
 
-Each node is aware of the others. The system can backtrack, retry, or refuse — not because a guardrail caught a bad output, but because the orchestration layer determined the evidence was inadequate.
+Most RAG failures happen before the final answer is written:
+- wrong retrieval strategy for the question type
+- redundant or weak context passed to the model
+- no explicit validation of evidence sufficiency
 
----
+CAG treats these as first-class architecture concerns.  
+Instead of just improving prompts, it improves the decision process that controls retrieval, context selection, and refusal/escalation.
 
-## TL;DR
+## IT - Cos'e CAG?
 
-- **What it is**: a graph-based retrieval reasoning system for grounded document QA.
-- **What makes it different**: it adds query typing, strategy-aware retrieval, diversity-aware context selection, language detection, validation, and escalation to the retrieval loop.
-- **Why it matters**: the hardest part of grounded QA is usually not generation itself — it is deciding what to retrieve, what to keep, whether the evidence is sufficient, and when to refuse.
+CAG e' un runtime di document QA guidato da grafo, pensato per chi vuole piu' controllo rispetto al classico `retrieve -> generate`.
 
----
+Loop principale:
 
-## RAG vs CAG
+`ENTRY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> VALIDATE -> EXIT`
+
+Perche' e' utile:
+- Strategia di retrieval adattata al tipo di query.
+- Selezione esplicita del contesto prima della generazione.
+- Validazione con confidence, rischio allucinazione ed escalation.
+- Maggiore ispezionabilita' per benchmark e debug.
+
+## IT - Idea Centrale
+
+L'idea centrale di CAG e' semplice e rigorosa:
+
+`La qualita' del grounding e' soprattutto un problema di orchestrazione del retrieval, non solo di generazione.`
+
+La maggior parte degli errori RAG nasce prima della risposta finale:
+- strategia di retrieval sbagliata per il tipo di domanda
+- contesto ridondante o debole passato al modello
+- assenza di validazione esplicita della sufficienza delle evidenze
+
+CAG tratta questi punti come scelte architetturali di primo livello.  
+Invece di migliorare solo i prompt, migliora il processo decisionale che governa retrieval, selezione contesto e refusal/escalation.
+
+## EN - CAG Logic (Full Flow)
+
+The runtime is a stateful graph with explicit decision points:
+
+`ENTRY -> CONTEXTUALIZE_QUERY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> REVIEW -> POST_GROUNDING -> VALIDATE -> EXIT`
+
+### 1. ENTRY
+- classifies query type (`GENERAL`, `PROCEDURAL`, `DIAGNOSTIC`, `CONFIGURATION`)
+- infers question scope (domain vs consultative vs personal)
+- detects response language
+- chooses retrieval strategy and initializes retrieval plan
+- resets runtime fields for a clean turn
+
+### 2. CONTEXTUALIZE_QUERY
+- checks conversation history
+- rewrites vague follow-ups into explicit retrieval-ready queries
+- preserves original intent while injecting context anchors from prior assistant answers
+
+### 3. RETRIEVE
+- builds query variants (rewrites + concept expansion)
+- queries document profiles first (Document Map)
+- if needed, falls back to global semantic retrieval
+- optionally merges hybrid lexical candidates
+- deduplicates and reranks chunks with discriminative lexical scoring
+
+### 4. SELECT_CONTEXT
+- ranks chunks for answerability, not only similarity
+- applies relevance/category/source diversity balancing
+- keeps a compact evidence set under context budget limits
+- produces ranked chunks + explicit gaps
+
+### 5. REASON + REVIEW
+- generates answer from selected evidence only
+- emits confidence, citations, hallucination risk
+- review pass tightens unsupported language and citation discipline
+
+### 6. POST_GROUNDING
+- sentence-level support checks against selected evidence
+- detects unsupported claims
+- adjusts confidence/risk when support is weak
+
+### 7. VALIDATE (Control Node)
+- decides one of three actions:
+  - `EXIT` with final answer
+  - `REASON` retry (narrower/safer generation)
+  - `RETRIEVE` adaptive retry (expanded query/strategy/top-k)
+- escalates when evidence is insufficient or risk remains high
+
+### 8. EXIT
+- returns final answer or escalation message
+- attaches diagnostics (`node_trace`, risk/confidence, fallback flags, actions)
+
+## EN - Decision Rules (Why It Refuses or Retries)
+
+CAG does not trust generation by default. It validates:
+- evidence sufficiency (`relevance_threshold`, moderate support checks)
+- confidence (`confidence_threshold`)
+- hallucination risk (`hallucination_threshold`)
+- unsupported-claim patterns in the produced answer
+
+If validation fails:
+- first try adaptive retrieval retry (if enabled and conditions match)
+- then try constrained reason retry
+- finally escalate instead of guessing
+
+## EN - Retrieval Design Details
+
+- Query typing drives strategy (`semantic`, `multi_evidence`, `hierarchical`)
+- Document Map is prioritized to reduce random top-k drift
+- Lexical discriminative scoring reduces redundant generic chunks
+- Hybrid lexical retrieval can be enabled for sparse semantic cases
+- Procedural flows can include neighboring chunks for sequence continuity
+
+## EN - Reasoning and Safety Contract
+
+The contract is:
+- answer only from evidence
+- cite what was used
+- state gaps explicitly
+- escalate when support is inadequate
+
+This makes CAG slower than naive RAG, but far more inspectable and safer for high-stakes document QA.
+
+## EN - ASCII Diagrams
+
+Full ASCII diagrams live here:
+- [CAG ASCII Flow](docs/cag-flow-ascii.md)
+
+Quick inline view:
 
 ```text
-Standard RAG
-  question
-    -> retrieve
-    -> generate
-    -> answer
-
-CAG
-  question
-    -> classify the request (type + scope + language)
-    -> retrieve candidate evidence (strategy-aware, multi-variant)
-    -> select the best context (cluster, categorize, diversity-reorder)
-    -> reason over selected evidence
-    -> validate (confidence + hallucination risk + evidence sufficiency)
-    -> answer / retry / escalate
+ENTRY -> CONTEXTUALIZE_QUERY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> REVIEW -> POST_GROUNDING -> VALIDATE -> EXIT
+                                              ^                                            |
+                                              |                                            |
+                                              +---------------- RETRIEVE RETRY <-----------+
+                                                                   ^
+                                                                   |
+                                                           REASON RETRY
 ```
 
-The key architectural difference is the **SELECT_CONTEXT** step. Standard RAG passes all retrieved chunks directly to generation. CAG first asks: *which of these chunks actually deserve to be in the answer prompt?*
+## EN - Animated GIF Walkthroughs
 
-Context selection matters because:
+Add animated walkthroughs in `docs/assets/`:
 
-- The top chunks by relevance score often overlap — they cover the same information from the same source. Passing them all wastes context window budget without adding information.
-- For a procedural query, the most relevant chunks might all cover prerequisites, while the actual step-by-step procedure is ranked slightly lower. Without category awareness, the answer misses critical information.
+- `docs/assets/cag-flow.gif`
+- `docs/assets/cag-validate-routing.gif`
+- `docs/assets/cag-retrieval-ladder.gif`
 
-The SELECT_CONTEXT node resolves both problems by choosing which chunks to include and in what order, respecting a budget of 6 chunks and balancing relevance, category diversity, source diversity, and query-type-specific priorities.
+Embed examples:
 
----
+![CAG Full Flow](docs/assets/cag-flow.gif)
+![CAG Validate Routing](docs/assets/cag-validate-routing.gif)
+![CAG Retrieval Ladder](docs/assets/cag-retrieval-ladder.gif)
 
-## CAG vs RAG at a Glance
+## IT - Logica CAG (Flusso Completo)
 
-| Area | Standard RAG | CAG |
-| --- | --- | --- |
-| Paradigm | retrieval-enhanced generation | self-aware retrieval reasoning |
-| Core flow | `retrieve -> generate` | `ENTRY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> VALIDATE -> EXIT` |
-| Query handling | one generic path | query-typed path selection |
-| Retrieval behavior | static top-k | strategy-aware, multi-variant |
-| Context passed to LLM | all retrieved chunks | diversity-selected subset (max 6) |
-| Grounding control | prompt-only | explicit validation and escalation |
-| Failure mode | answers even with weak support | can refuse or escalate unsupported requests |
-| Language support | typically English-only | 55+ languages, auto-detected |
-| Benchmark story | usually ad hoc | built-in evaluation harness with ablation baselines |
+Il runtime e' un grafo stateful con punti decisionali espliciti:
 
----
+`ENTRY -> CONTEXTUALIZE_QUERY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> REVIEW -> POST_GROUNDING -> VALIDATE -> EXIT`
 
-## Quick Start
+### 1. ENTRY
+- classifica il tipo di query (`GENERAL`, `PROCEDURAL`, `DIAGNOSTIC`, `CONFIGURATION`)
+- identifica lo scope della domanda (domain/consultative/personal)
+- rileva la lingua di risposta
+- sceglie strategia retrieval e inizializza il piano
+- resetta i campi runtime del turno
+
+### 2. CONTEXTUALIZE_QUERY
+- usa la history conversazionale
+- riscrive follow-up vaghi in query piu' esplicite
+- mantiene intento originale aggiungendo anchor dal contesto precedente
+
+### 3. RETRIEVE
+- costruisce varianti query (rewrite + concept expansion)
+- interroga prima i document profile (Document Map)
+- se necessario, fallback su retrieval semantico globale
+- opzionalmente unisce candidati lexical hybrid
+- deduplica e reranka con scoring lessicale discriminativo
+
+### 4. SELECT_CONTEXT
+- ordina i chunk per answerability, non solo similarita'
+- bilancia rilevanza/diversita' categoria/diversita' fonte
+- mantiene un set evidenze compatto entro i limiti di budget
+- produce chunk ordinati + gap espliciti
+
+### 5. REASON + REVIEW
+- genera risposta solo dal contesto selezionato
+- emette confidence, citazioni, rischio allucinazione
+- passaggio review per stringere linguaggio non supportato
+
+### 6. POST_GROUNDING
+- controlli frase-per-frase contro le evidenze selezionate
+- rileva claim non supportati
+- aggiorna confidence/risk quando il supporto e' debole
+
+### 7. VALIDATE (Nodo di Controllo)
+- decide una delle tre azioni:
+  - `EXIT` con risposta finale
+  - retry `REASON` (generazione piu' stretta/sicura)
+  - retry `RETRIEVE` adattivo (query/strategia/top-k espansi)
+- scala quando evidenza e' insufficiente o rischio resta alto
+
+### 8. EXIT
+- restituisce risposta finale o messaggio di escalation
+- allega diagnostica (`node_trace`, risk/confidence, fallback, azioni)
+
+## IT - Regole Decisionali (Perche' Riprova o Escala)
+
+CAG non si fida della generazione in automatico. Valida:
+- sufficienza evidenze (`relevance_threshold` e supporti moderati)
+- confidence (`confidence_threshold`)
+- rischio allucinazione (`hallucination_threshold`)
+- pattern di claim non supportati nella risposta
+
+Se la validazione fallisce:
+- prima retry retrieval adattivo (se abilitato)
+- poi retry reason vincolato
+- infine escalation invece di indovinare
+
+## IT - Diagrammi ASCII
+
+I diagrammi ASCII completi sono qui:
+- [Flusso ASCII CAG](docs/cag-flow-ascii.md)
+
+Vista inline rapida:
+
+```text
+ENTRY -> CONTEXTUALIZE_QUERY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> REVIEW -> POST_GROUNDING -> VALIDATE -> EXIT
+                                              ^                                            |
+                                              |                                            |
+                                              +---------------- RETRIEVE RETRY <-----------+
+                                                                   ^
+                                                                   |
+                                                           REASON RETRY
+```
+
+## IT - GIF Animate (Walkthrough)
+
+Aggiungi GIF animate in `docs/assets/`:
+
+- `docs/assets/cag-flow.gif`
+- `docs/assets/cag-validate-routing.gif`
+- `docs/assets/cag-retrieval-ladder.gif`
+
+## EN - Start Here
+
+- [Quickstart](docs/quickstart.md)
+- [API](docs/api.md)
+- [Configuration](docs/configuration.md)
+- [Evaluation](docs/evaluation.md)
+- [Examples](docs/examples.md)
+- [Integration](docs/integration.md)
+- [Architecture](docs/cag-architecture.md)
+- [Knowledge Compiler](docs/knowledge-compiler.md)
+- [Community](docs/community.md)
+
+Fast path:
+
+```bash
+pip install -e ".[dev,eval,api]"
+cag demo --reset --json
+```
+
+## IT - Inizia Da Qui
+
+- [Quickstart](docs/quickstart.md)
+- [API](docs/api.md)
+- [Configurazione](docs/configuration.md)
+- [Valutazione](docs/evaluation.md)
+- [Esempi](docs/examples.md)
+- [Integrazione](docs/integration.md)
+- [Architettura](docs/cag-architecture.md)
+- [Knowledge Compiler](docs/knowledge-compiler.md)
+- [Community](docs/community.md)
+
+Percorso veloce:
+
+```bash
+pip install -e ".[dev,eval,api]"
+cag demo --reset --json
+```
+
+## EN - 5 Minute Quickstart
 
 ```bash
 python -m venv .venv
 .venv\Scripts\activate   # Windows
-pip install -e .
-cag ingest --data-dir ./data/raw
-cag eval --system cag --limit 3
+pip install -e ".[dev,eval,api]"
+cag demo --reset --json
 ```
 
----
+Expected output: JSON answer with confidence, citations, escalation state, and node trace.
 
-## Installable Package
-
-CAG is installed as a local editable package and used through the `cag` CLI.
-
-```bash
-pip install -e .
-```
-
-Useful subcommands:
-
-```bash
-cag ingest   --data-dir ./data/raw
-cag query    "How is this workflow configured?"
-cag eval     --system cag --limit 3
-cag eval-audit
-cag compare  --runs ./artifacts/eval_runs/<run_a> ./artifacts/eval_runs/<run_b>
-```
-
-Windows triplet benchmark launcher:
-
-```powershell
-.\run_eval_triplet.ps1
-```
-
----
-
-## What This Repo Gives You
-
-- a graph-based CAG runtime with explicit context selection
-- a fair benchmark harness against multiple baselines
-- a generic document-oriented stack rather than a domain-specific demo
-- a React + FastAPI preview path for local experimentation
-
----
-
-## API Preview Notes
-
-- `/query` accepts per-request validation thresholds without mutating global process settings
-- `/query` and `/upload` support preview protection via `X-API-Key` when `CAG_API_KEY` is configured
-- `/upload` validates filename, extension, and upload size before writing to `data/raw/`
-- query and benchmark outputs expose `fallback_used` and `fallback_reason` so degraded agent paths are visible instead of silent
-- the eval harness injects retrieval search explicitly instead of patching global graph functions
-
-How preview API protection works:
-
-- `CAG_API_KEY` is the shared secret stored on the backend in `.env`
-- `X-API-Key` is the HTTP header that the client sends on each request to `/query` and `/upload`
-- the backend compares the incoming `X-API-Key` value with `CAG_API_KEY`
-- if they match, the request is accepted
-- if `CAG_API_KEY` is set and the header is missing or wrong, the API returns `401` or `403`
-- if `CAG_API_KEY` is not set, the preview API stays open locally and logs a warning instead of blocking requests
-
-Example `.env`:
-
-```env
-CAG_API_KEY=my-preview-key
-```
-
-Example preview request:
-
-```bash
-curl -X POST http://localhost:8000/query \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: $CAG_API_KEY" \
-  -d '{
-    "query": "What is the minimum RAM required to run Nexus Platform?",
-    "relevance_threshold": 0.7,
-    "confidence_threshold": 0.6,
-    "hallucination_threshold": 0.3
-  }'
-```
-
----
-
-## Benchmark Snapshot
-
-This repo is built to make the orchestration claim inspectable, not just assertive.
-
-- compare `cag` against `cag_no_selection`, `rag_baseline`, `direct_baseline`, and `lightrag_baseline`
-- inspect machine-readable artifacts in `artifacts/eval_runs/` and `artifacts/eval_comparisons/`
-- rerun the same benchmark with `--runs N` when you want repeated-run statistics instead of a single descriptive comparison
-
-The current benchmark design tracks context selection quality directly:
-
-- `context_precision_score`: fraction of selected context chunks whose sources match gold sources
-- `retrieved_chunk_count` and `selected_chunk_count`: minimal counters to interpret context quality and budget
-- `cag_no_selection`: ablation that keeps the same retrieval and validation flow but disables context selection — this isolates the contribution of SELECT_CONTEXT to answer quality
-- `cag eval-audit`: benchmark coverage check for dataset size, balance, duplicate questions, and corpus-source coverage
-
-Latest 100-question triplet snapshot:
-
-| System | Grounded Answer | Context Precision | Hallucination Rate | Task Success |
-| --- | ---: | ---: | ---: | ---: |
-| `cag` | 0.848 | 0.878 | 0.100 | 0.820 |
-| `cag_no_selection` | 0.799 | 0.645 | 0.150 | 0.750 |
-| `rag_baseline` | 0.824 | 0.531 | 0.110 | 0.760 |
-
-The strongest current claim is not yet "CAG is universally superior on every final metric." It is:
-
-**CAG selects evidence much better than both `cag_no_selection` and `rag_baseline`, and that better context selection improves downstream task success while slightly reducing hallucination.**
-
-The gap between `cag` and `cag_no_selection` isolates the contribution of the SELECT_CONTEXT step: same retrieval, same reasoning agent, same validation — only context selection disabled. The 23-point context precision gap (0.878 vs 0.645) and 7-point task success gap (0.820 vs 0.750) show the measurable impact of deliberate evidence selection.
-
----
-
-## Project Status
-
-**Version:** 0.2  
-**Status:** Preview
-
-**Audience:** AI builders and practitioners exploring retrieval, agentic orchestration, and grounded QA
-
-**What changed in 0.2:**
-
-- The SELECT_CONTEXT stage is now architecturally explicit in the code, graph, and documentation. Previously named REFINE, it has been renamed to reflect its actual responsibility: evidence scoring, clustering, semantic categorization, and diversity-aware context selection. The graph node is `select_context`, the routing function is `route_after_select_context`, and the node trace now records `SELECT_CONTEXT`.
-- Documentation updated throughout (`cag-architecture.md`, `README.md`) to use the correct terminology.
-
-**Current non-goals:**
-- production SLA
-- hosted multi-tenant deployment
-- broad domain benchmark coverage
-- turnkey package distribution
-
----
-
-## Why CAG Over Standard RAG?
-
-To be clear: advanced RAG systems already exist. Production RAG pipelines routinely include reranking, query decomposition, guardrails, and other improvements over naive retrieval. CAG is not claiming that all RAG is simplistic.
-
-The distinction is architectural, not incremental. In standard RAG -- even advanced RAG -- retrieval is a preprocessing step: documents are fetched and then passed to a generator. The retrieval layer does not reason about what it is doing. Guardrails and rerankers are usually bolted on as separate stages rather than integrated into a single reasoning loop.
-
-CAG uses "Cognitive" in the specific sense of meta-cognition: the system reasons about its own reasoning. The orchestration layer is not a passive pipeline -- it is part of the system's intelligence. It:
-
-- **classifies the query type** before deciding how to search
-- **detects the user's language** and responds in kind (55+ languages)
-- **selects and adapts the retrieval strategy** based on what kind of question is being asked
-- **selects the best context** from retrieved evidence before generation begins — this is the SELECT_CONTEXT step
-- **evaluates evidence quality** after selection, surfacing gaps before generation begins
-- **validates the generated answer** against the evidence and can refuse to answer when support is insufficient
-
-### The SELECT_CONTEXT Step in Detail
-
-After retrieval, the system has a pool of candidate chunks. Before passing anything to the reasoning agent, SELECT_CONTEXT:
-
-1. **Clusters** the chunks by keyword and source proximity
-2. **Assigns semantic categories** (e.g. `ordered_steps`, `prerequisites`, `error_causes`, `settings`) using an LLM-assisted categorization
-3. **Scores each chunk** for relevance on a 0–1 scale
-4. **Reorders** the pool using a greedy diversity-aware algorithm that balances:
-   - relevance score
-   - category diversity (avoiding redundant category overrepresentation)
-   - cluster diversity (avoiding near-duplicate evidence)
-   - query-type-specific priorities (e.g. PROCEDURAL queries get a bonus for `ordered_steps` chunks)
-   - near-duplicate penalty (chunks with >72% keyword similarity to already-selected chunks are penalized)
-5. **Passes** at most 6 chunks to the reasoning agent
-
-This means the reasoning agent always receives a small, intentional context set — not a raw dump of whatever happened to score highest.
-
-### The Difference in Plain Language
-
-RAG answers a question by retrieving relevant chunks and asking the model to answer from them.
-
-CAG first asks a higher-level question:
-
-`What kind of problem is this, what kind of evidence would justify an answer, which specific chunks are most informative together, and is the current evidence strong enough to answer at all?`
-
-That difference matters because the hardest part of grounded QA is often not generation itself. It is deciding:
-- what to retrieve
-- what to keep
-- whether the retrieved material is enough
-- how much confidence is justified
-- when the system should stop and refuse instead of guessing
-
-### Practical Advantages of CAG
-
-- **Better control over failure modes**: CAG can refuse or escalate unsupported requests instead of answering with weak confidence.
-- **More appropriate retrieval behavior**: procedural, diagnostic, and factual questions do not share the same retrieval path.
-- **Stronger grounding discipline**: evidence is selected, refined, and validated before the answer is treated as trustworthy.
-- **More interpretable orchestration**: the graph makes it easier to inspect how the system reached an answer or why it declined.
-- **More meaningful evaluation**: the benchmark harness lets you compare orchestration strategies, not only model outputs.
-
----
-
-## When To Use CAG
-
-Use CAG when:
-- you want the system to adapt retrieval behavior to different query types
-- you care about grounded answers more than raw response speed
-- you want explicit refusal or escalation behavior on weakly supported requests
-- you want to benchmark orchestration quality, not just model quality
-
-Do not use CAG when:
-- you only need simple semantic search plus one-shot answering
-- latency and minimal complexity matter more than control
-- you do not need benchmarkable retrieval behavior
-- a plain RAG stack already solves your use case cleanly
-
----
-
-## Current Maturity
-
-Solid today:
-- graph-based CAG runtime with explicit SELECT_CONTEXT stage
-- automatic language detection (55+ languages via langdetect)
-- benchmark harness with multiple systems including `cag_no_selection` ablation
-- React + FastAPI preview path
-- passing test suite and frontend production build
-
-Still experimental:
-- benchmark size and corpus diversity
-- prompt-level stability across providers
-- LightRAG comparison path depending on external credentials/runtime
-
-Still needs work before a stable release:
-- broader evaluation corpus
-- richer CI and release automation over time
-- more polished onboarding assets and demo material
-- stronger contributor workflow and long-term governance
-
----
-
-## Quick Proof
-
-The fastest way to see the project's shape is:
-
-1. run tests
-2. run a small benchmark
-3. inspect the generated artifacts
-
-Smoke benchmark example:
-
-```bash
-cag eval --system cag --limit 3
-```
-
-Comparison example:
-
-```bash
-cag eval --system rag_baseline --limit 3 --judge-mode off
-cag eval --system cag_no_selection --limit 3 --judge-mode off
-cag eval --system cag --limit 3 --judge-mode off
-cag compare --runs ./artifacts/eval_runs/<rag_run> ./artifacts/eval_runs/<cag_no_selection_run> ./artifacts/eval_runs/<cag_run>
-```
-
-Expected artifact locations:
-- `artifacts/eval_runs/<timestamp>_cag/run.json`
-- `artifacts/eval_runs/<timestamp>_cag/results.jsonl`
-- `artifacts/eval_comparisons/<timestamp>_comparison/comparison.md`
-
-Example of what a successful run leaves behind:
-
-```text
-artifacts/
-  eval_runs/
-    20260407T120000Z_cag/
-      run.json
-      results.jsonl
-```
-
----
-
-## Canonical Local Validation Flow
-
-This is the recommended preview path.
-
-### 1. Install CAG
+## IT - Quickstart In 5 Minuti
 
 ```bash
 python -m venv .venv
+.venv\Scripts\activate   # Windows
+pip install -e ".[dev,eval,api]"
+cag demo --reset --json
 ```
 
-Windows:
+Output atteso: risposta JSON con confidence, citazioni, stato escalation e node trace.
 
-```bash
-.venv\Scripts\activate
-```
+## EN - Community-First Goals
 
-macOS/Linux:
+CAG is a public repository and aims to become a community reference project.
 
-```bash
-source .venv/bin/activate
-```
+Current priorities:
+- Reproducible benchmarks and transparent claims.
+- Small, frequent releases with clear changelog entries.
+- Strong onboarding and reliable local demo path.
+- Honest documentation of limits and tradeoffs.
 
-Then install the core package:
+## IT - Obiettivi Community-First
 
-```bash
-pip install -e .
-```
+CAG e' un repository pubblico e punta a diventare un punto di riferimento per la community.
 
-Optional dependency groups:
+Priorita' attuali:
+- Benchmark riproducibili e claim trasparenti.
+- Release piccole e frequenti con changelog chiaro.
+- Onboarding solido e demo locale affidabile.
+- Documentazione onesta di limiti e tradeoff.
 
-```bash
-pip install -e ".[dev]"         # pytest and local dev tooling
-pip install -e ".[eval]"        # benchmark evaluation
-pip install -e ".[lightrag]"    # LightRAG baseline comparison
-pip install -e ".[pinecone]"    # Pinecone vector store
-pip install -e ".[ui]"          # Streamlit UI
-pip install -e ".[api]"         # FastAPI server
-pip install -e ".[all]"         # everything
-```
+## EN - Data Safety (Raw Documents)
 
-### 2. Configure environment
+- `data/raw` is for local ingestion only.
+- Source documents used for experiments should not be committed to Git.
+- Keep only sanitized demo corpora intended for public distribution.
+- Never commit API keys, secrets, customer data, or confidential files.
 
-Windows:
+Current repository policy:
+- raw `.pdf`, `.txt`, `.md` under `data/raw/` are ignored by `.gitignore`
+- benchmark corpus stays in `data/benchmark_corpus/`
 
-```bash
-copy .env.example .env
-```
+## IT - Sicurezza Dati (Documenti Raw)
 
-macOS/Linux:
+- `data/raw` e' solo per ingest locale.
+- I documenti sorgente usati negli esperimenti non vanno committati su Git.
+- Nel repository pubblico devono restare solo corpora demo sanitizzati.
+- Non committare mai API key, segreti, dati cliente o file confidenziali.
 
-```bash
-cp .env.example .env
-```
+Policy attuale del repository:
+- i file raw `.pdf`, `.txt`, `.md` in `data/raw/` sono ignorati da `.gitignore`
+- il corpus benchmark rimane in `data/benchmark_corpus/`
 
-Then set at least:
-- `LLM_PROVIDER`
-- `OPENAI_API_KEY` if you use OpenAI-backed flows
-- `CAG_API_KEY` if you want preview protection for `/query` and `/upload`
+## EN - Known Limits
 
-If you set:
+- Benchmark coverage is still limited compared to real production variability.
+- Cost and latency overhead are higher than simple RAG.
+- Some retrieval gains are dataset-sensitive and should be validated per domain.
+- Multi-provider behavior may vary due to model differences.
+
+## EN - STRICT_FAST Mode (Faster, Still Rigorous)
+
+If you need lower latency while preserving validation/escalation logic:
 
 ```env
-CAG_API_KEY=my-preview-key
+STRICT_FAST_PROFILE=true
 ```
 
-then your client must send:
+This profile automatically applies speed-oriented runtime caps:
+- lower retrieval/context budgets
+- disables adaptive retrieval retry
+- disables hybrid lexical merge
+- keeps fast deterministic context selection on
 
-```http
-X-API-Key: my-preview-key
+What stays strict:
+- `VALIDATE` node still controls final routing
+- confidence and hallucination thresholds are still enforced
+- escalation still happens when evidence is insufficient
+
+## IT - Limiti Noti
+
+- La copertura benchmark e' ancora limitata rispetto alla variabilita' reale in produzione.
+- Costo e latenza sono piu' alti rispetto a RAG semplice.
+- Alcuni miglioramenti di retrieval sono sensibili al dataset e vanno validati per dominio.
+- Il comportamento multi-provider puo' variare per differenze tra modelli.
+
+## IT - Modalita STRICT_FAST (Piu' Veloce, Ancora Rigorosa)
+
+Se vuoi ridurre la latenza mantenendo validazione/escalation:
+
+```env
+STRICT_FAST_PROFILE=true
 ```
 
-on requests to `/query` and `/upload`.
+Questo profilo applica automaticamente override orientati alla velocita':
+- budget retrieval/context piu' bassi
+- disattiva adaptive retrieval retry
+- disattiva merge lexical hybrid
+- mantiene attiva la context selection deterministica veloce
 
-### 3. Use your own corpus
+Cosa resta rigoroso:
+- il nodo `VALIDATE` continua a controllare il routing finale
+- le soglie di confidence/hallucination restano attive
+- l'escalation resta attiva quando l'evidenza non basta
 
-Place your own documents (`.pdf`, `.txt`, `.md`) in `data/raw/`. The repository does not ship with sample documents.
+## EN - 30-Day Roadmap
 
-### 4. Ingest documents
+1. Publish updated triplet benchmark snapshot after hybrid retrieval changes.
+2. Add retrieval diagnostics to public outputs with clearer score explanations.
+3. Strengthen release automation (benchmark artifact checks + release checklist).
+4. Expand docs/examples for contributor onboarding and reproducibility.
 
-```bash
-cag ingest --data-dir ./data/raw
-```
+## IT - Roadmap 30 Giorni
 
-### 5. Run tests
+1. Pubblicare snapshot benchmark triplet aggiornato dopo i cambi hybrid retrieval.
+2. Aggiungere diagnostica retrieval negli output pubblici con spiegazioni score piu' chiare.
+3. Rafforzare automazione release (controlli artifact benchmark + checklist release).
+4. Espandere docs/esempi per onboarding contributor e riproducibilita'.
+
+## EN - Pre-Push Public Checklist
+
+1. Rotate any exposed API keys and verify `.env` is never committed.
+2. Confirm `data/raw` contains no tracked private documents.
+3. Run tests and benchmark smoke checks.
+4. Update benchmark snapshot in docs with date and command.
+5. Publish changelog/release notes with known limits.
+
+## IT - Checklist Pre-Push Pubblico
+
+1. Ruota eventuali API key esposte e verifica che `.env` non venga mai committato.
+2. Conferma che in `data/raw` non ci siano documenti privati tracciati.
+3. Esegui test e benchmark smoke.
+4. Aggiorna snapshot benchmark nelle docs con data e comando.
+5. Pubblica changelog/release notes con limiti noti.
+
+## EN - RAG vs CAG (Short)
+
+Standard RAG:
+
+`question -> retrieve -> generate -> answer`
+
+CAG:
+
+`question -> classify -> retrieve -> select context -> reason -> validate -> answer/retry/escalate`
+
+## IT - RAG vs CAG (Breve)
+
+RAG standard:
+
+`domanda -> retrieve -> generate -> risposta`
+
+CAG:
+
+`domanda -> classify -> retrieve -> select context -> reason -> validate -> risposta/retry/escalation`
+
+## EN - Local Validation Flow
 
 ```bash
 pip install -e ".[dev,eval,api]"
 pytest
-```
-
-### 6. Run a smoke benchmark
-
-```bash
-cag eval --system cag --limit 3
-```
-
-### 7. Optionally run the API/UI
-
-Recommended preview API + UI:
-
-```bash
+cag eval --system cag --limit 3 --judge-mode off
 python -m uvicorn cag.api.upload:app --reload --port 8000
+```
+
+Optional frontend:
+
+```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-Secondary/dev-facing UI:
+## IT - Flusso Di Validazione Locale
 
 ```bash
-streamlit run src/cag/ui/app.py
+pip install -e ".[dev,eval,api]"
+pytest
+cag eval --system cag --limit 3 --judge-mode off
+python -m uvicorn cag.api.upload:app --reload --port 8000
 ```
 
----
-
-## Benchmarking
-
-Benchmarking is a first-class feature of this preview.
-
-Available systems:
-- `cag`
-- `cag_no_selection`
-- `rag_baseline`
-- `direct_baseline`
-- `lightrag_baseline`
-
-Method note:
-- same benchmark corpus
-- same embedding stack
-- same retrieval corpus boundaries
-- same or comparable generator family where applicable
-- the orchestration path is the main variable under comparison
-
-Typical commands:
+Frontend opzionale:
 
 ```bash
-cag eval --system cag
-cag eval --system cag_no_selection
-cag eval --system rag_baseline
-cag eval --system direct_baseline
-cag eval --system lightrag_baseline
-cag compare --runs ./artifacts/eval_runs/<run_a> ./artifacts/eval_runs/<run_b>
+cd frontend
+npm install
+npm run dev
 ```
 
-For repeated-run significance checks:
-
-```bash
-cag eval --system cag --runs 3
-cag eval --system rag_baseline --runs 3
-cag compare --runs ./artifacts/eval_runs/<cag_multi_run> ./artifacts/eval_runs/<rag_multi_run>
-```
-
-`compare` accepts both single-run directories and multi-run directories. When multiple runs are provided for the same system, the statistical comparison uses the mean score per question across runs.
-
-Known benchmark limitations:
-- the benchmark is now stronger, but still single-corpus by default
-- `cost_estimate` is a relative estimate, not billing truth
-- results currently support a stronger context-selection claim than a universal paradigm-superiority claim
-
----
-
-## First-Run Troubleshooting
-
-Missing API key:
-- verify `.env` exists
-- verify the provider-specific key is set
-- if `/query` or `/upload` returns `401` or `403`, verify `CAG_API_KEY` and the `X-API-Key` header
-- LightRAG currently expects an OpenAI-backed path
-
-No documents found:
-- add files under `data/raw/`
-- confirm supported extensions: `.pdf`, `.txt`, `.md`
-
-Upload rejected:
-- check the file extension is one of `.pdf`, `.txt`, `.md`
-- check the file is below `10 MiB`
-- check the total request size is below `25 MiB`
-
-Vector DB path issues:
-- check `CHROMA_PERSIST_DIR`
-- delete and rebuild local preview indexes only if you intentionally want a fresh local state
-
-LightRAG issues:
-- make sure `OPENAI_API_KEY` is set
-- use the generic benchmark first before trying the LightRAG path
-
-Frontend/API mismatch:
-- start FastAPI on `http://localhost:8000`
-- start the React preview from `frontend/`
-
----
-
-## Repository Structure
+## EN - Repository Structure
 
 ```text
 src/cag/
-  agents/        # Retrieval agent (evidence ranking + context selection) and reasoning agent
-  api/           # FastAPI upload and query endpoints
-  eval/          # Benchmark runner, scoring, comparison, datasets
-  graph/         # LangGraph state, nodes (ENTRY, RETRIEVE, SELECT_CONTEXT, REASON, VALIDATE, EXIT), routing
-  ingestion/     # Loader, chunker, embeddings, vector store integration
-  ui/            # Streamlit interface
-docs/            # Public architecture and project docs
+  agents/        # Retrieval + reasoning agents
+  api/           # FastAPI upload/query endpoints
+  eval/          # Benchmarks, scoring, comparisons
+  graph/         # Nodes, state, routing
+  ingestion/     # Loader, chunker, embeddings, vector store
+  retrieval/     # Lexical scoring and context dedupe
+  knowledge/     # DB-first compiled knowledge layer
 frontend/        # React preview UI
-tests/           # Unit and harness tests
-data/raw/        # Source documents for ingestion
-artifacts/       # Generated benchmark artifacts
-data/chroma_db/  # Local Chroma runtime data
+docs/            # Project docs
+tests/           # Unit and integration tests
 ```
 
----
+## IT - Struttura Del Repository
 
-## Convenience Scripts
+```text
+src/cag/
+  agents/        # Agenti retrieval + reasoning
+  api/           # Endpoint FastAPI upload/query
+  eval/          # Benchmark, scoring, confronti
+  graph/         # Nodi, stato, routing
+  ingestion/     # Loader, chunker, embedding, vector store
+  retrieval/     # Scoring lessicale e dedupe contesto
+  knowledge/     # Layer DB-first di knowledge compilata
+frontend/        # UI React di anteprima
+docs/            # Documentazione progetto
+tests/           # Test unitari e integrazione
+```
 
-The `.bat` files (Windows) and `.sh` files (macOS/Linux) in the repo are convenience launchers for local use. They are **not** the primary documented install or validation path for this preview.
-
----
-
-## Community
+## EN - Community
 
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 - [SECURITY.md](SECURITY.md)
+- [NOTICE](NOTICE)
+
+## IT - Community
+
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+- [SECURITY.md](SECURITY.md)
+- [NOTICE](NOTICE)
+
+## EN - Attribution Request
+
+CAG is released under MIT.  
+If you use CAG publicly, attribution is appreciated:
+
+`Built with CAG by Fabio Scialanga`
+
+## IT - Richiesta Di Attribuzione
+
+CAG e' rilasciato con licenza MIT.  
+Se usi CAG in pubblico, l'attribuzione e' apprezzata:
+
+`Built with CAG by Fabio Scialanga`
 
 ## License
 
-This repository includes a top-level [LICENSE](LICENSE).
+[MIT](LICENSE)
+

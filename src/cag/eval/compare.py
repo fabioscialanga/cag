@@ -85,6 +85,11 @@ def _collapse_results_by_question(results: list[ScoredResult]) -> list[ScoredRes
                         if (valid := [item.context_precision_score for item in items if item.context_precision_score is not None])
                         else None
                     ),
+                    "context_recall_score": (
+                        mean(valid)
+                        if (valid := [item.context_recall_score for item in items if item.context_recall_score is not None])
+                        else None
+                    ),
                     "unsupported_claim_score": mean(item.unsupported_claim_score for item in items),
                     "confidence": mean(item.confidence for item in items),
                     "hallucination_risk": mean(item.hallucination_risk for item in items),
@@ -119,6 +124,7 @@ def _aggregate_metrics(manifests: list[RunManifest]) -> AggregateMetrics:
         point_coverage=mean(metric.point_coverage for metric in metrics_list),
         source_grounding=mean(metric.source_grounding for metric in metrics_list),
         context_precision_score=maybe_mean([metric.context_precision_score for metric in metrics_list]),
+        context_recall_score=maybe_mean([metric.context_recall_score for metric in metrics_list]),
         hallucination_rate=mean(metric.hallucination_rate for metric in metrics_list),
         escalation_precision=maybe_mean([metric.escalation_precision for metric in metrics_list]),
         false_escalation_rate=mean(metric.false_escalation_rate for metric in metrics_list),
@@ -277,6 +283,7 @@ def _delta_vs_baseline(metrics_by_system: dict[str, AggregateMetrics], baseline_
     metric_names = [
         "grounded_answer_score",
         "context_precision_score",
+        "context_recall_score",
         "hallucination_rate",
         "task_success_rate",
         "avg_latency_ms",
@@ -313,8 +320,8 @@ def _build_markdown(
         "",
         "## Aggregate Metrics",
         "",
-        "| System | Runs | Grounded Answer | Context Precision | Hallucination Rate | Task Success | Escalation Precision | False Escalation | Avg Latency (ms) | Avg Cost |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| System | Runs | Grounded Answer | Context Precision | Context Recall | Hallucination Rate | Task Success | Escalation Precision | False Escalation | Avg Latency (ms) | Avg Cost |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
 
     for manifest in manifests:
@@ -327,6 +334,7 @@ def _build_markdown(
                     str((run_counts_by_system or {}).get(manifest.system, 1)),
                     _format_metric(metrics.grounded_answer_score),
                     _format_metric(metrics.context_precision_score),
+                    _format_metric(metrics.context_recall_score),
                     _format_metric(metrics.hallucination_rate),
                     _format_metric(metrics.task_success_rate),
                     _format_metric(metrics.escalation_precision),
@@ -340,8 +348,8 @@ def _build_markdown(
 
     if deltas_vs_rag:
         lines.extend(["", "## Delta vs RAG Baseline", ""])
-        lines.append("| System | Grounded Answer | Context Precision | Hallucination Rate | Task Success | Avg Latency (ms) | Avg Cost |")
-        lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: |")
+        lines.append("| System | Grounded Answer | Context Precision | Context Recall | Hallucination Rate | Task Success | Avg Latency (ms) | Avg Cost |")
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |")
         for system, metrics in sorted(deltas_vs_rag.items()):
             lines.append(
                 "| "
@@ -350,6 +358,7 @@ def _build_markdown(
                         system,
                         _format_metric(metrics["grounded_answer_score"]),
                         _format_metric(metrics["context_precision_score"]),
+                        _format_metric(metrics["context_recall_score"]),
                         _format_metric(metrics["hallucination_rate"]),
                         _format_metric(metrics["task_success_rate"]),
                         _format_metric(metrics["avg_latency_ms"]),
@@ -363,12 +372,13 @@ def _build_markdown(
     for manifest in manifests:
         lines.append(f"### {manifest.system}")
         lines.append("")
-        lines.append("| Query Type | Grounded Answer | Context Precision | Task Success | Hallucination Rate |")
-        lines.append("| --- | ---: | ---: | ---: | ---: |")
+        lines.append("| Query Type | Grounded Answer | Context Precision | Context Recall | Task Success | Hallucination Rate |")
+        lines.append("| --- | ---: | ---: | ---: | ---: | ---: |")
         for query_type, metrics in manifest.by_query_type.items():
             lines.append(
                 f"| {query_type} | {_format_metric(metrics.grounded_answer_score)} | "
-                f"{_format_metric(metrics.context_precision_score)} | {_format_metric(metrics.task_success_rate)} | "
+                f"{_format_metric(metrics.context_precision_score)} | {_format_metric(metrics.context_recall_score)} | "
+                f"{_format_metric(metrics.task_success_rate)} | "
                 f"{_format_metric(metrics.hallucination_rate)} |"
             )
         lines.append("")

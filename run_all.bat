@@ -7,10 +7,12 @@ setlocal enableextensions enabledelayedexpansion
 set REPO_DIR=%~dp0
 echo Starting CAG preview services from %REPO_DIR%
 
-start "CAG API" cmd /k "cd /d "%REPO_DIR%" && .venv\Scripts\activate.bat && python -m uvicorn cag.api.upload:app --reload --host 0.0.0.0 --port 8000"
-start "CAG Frontend" cmd /k "cd /d "%REPO_DIR%frontend" && npm install && npm run dev -- --host 0.0.0.0"
+start "CAG API" "%REPO_DIR%run_api.bat"
+start "CAG Frontend" "%REPO_DIR%run_frontend.bat"
 
 echo Started two windows: API and React frontend.
+echo Backend:  http://127.0.0.1:8010
+echo Frontend: http://127.0.0.1:5176
 echo Use these launchers only as local Windows conveniences.
 
 endlocal

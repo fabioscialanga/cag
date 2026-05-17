@@ -29,7 +29,10 @@ jobs:
         env:
           OPENAI_API_KEY: "sk-test-placeholder"
           CAG_API_KEY: ""
-        run: pytest --ignore=tests/test_agents_integration.py --ignore=tests/test_api.py -q
+        run: pytest --ignore=tests/test_agents_integration.py -q
+
+      - name: Build Python package
+        run: python -m build
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -38,7 +41,7 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: frontend
-        run: npm install
+        run: npm ci
 
       - name: Build frontend
         working-directory: frontend

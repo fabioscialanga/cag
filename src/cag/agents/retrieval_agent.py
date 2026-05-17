@@ -11,10 +11,15 @@ from collections import defaultdict
 from agno.agent import Agent
 
 from cag.agents.models import RankedChunk, RetrievalOutput
+from cag.config import settings
 from cag.llm_factory import get_agno_model
+from cag.retrieval.lexical import build_weighted_query_terms as _build_weighted_query_terms
+from cag.retrieval.lexical import discriminative_document_score as _discriminative_document_score
+from cag.retrieval.lexical import document_terms as _document_terms
+from cag.retrieval.lexical import expand_query_concepts as _expand_query_concepts
 
 logger = logging.getLogger(__name__)
-SELECTION_CONTEXT_LIMIT = 6
+SELECTION_CONTEXT_LIMIT = 8
 STOPWORDS = {
     "a", "about", "an", "and", "are", "as", "at", "be", "by", "do", "for", "from",
     "how", "if", "in", "is", "it", "of", "on", "or", "that", "the", "this", "to",
@@ -89,12 +94,40 @@ _RETRIEVAL_INSTRUCTIONS = [
     "- CONFIGURATION: prioritize prerequisites, settings, fields, and options.",
     "- GENERAL: prioritize definitions, constraints, timelines, and context.",
     "",
+    "SCORING RUBRIC:",
+    "- 0.90-1.00: directly answers the core question, with exact entity, step, field, error, or service.",
+    "- 0.70-0.89: strongly useful supporting evidence, but may need another chunk for completeness.",
+    "- 0.45-0.69: related background or partial evidence; keep only if it fills a different category.",
+    "- 0.00-0.44: generic, duplicate, or off-topic evidence; include only when no better evidence exists.",
+    "",
+    "BORDERLINE RULES:",
+    "- Do not over-score a chunk just because it shares broad words like service, document, system, or workflow.",
+    "- For PROCEDURAL queries, preserve sequence: prerequisites/navigation before steps, steps before notes.",
+    "- For DIAGNOSTIC queries, prefer chunks that pair a symptom/error with a check or resolution.",
+    "- For CONFIGURATION queries, prefer exact parameters, fields, limits, and permissions over overview text.",
+    "- Mark real gaps when required parts are missing instead of inflating weak chunks.",
+    "",
+    "FEW-SHOT EXAMPLES:",
+    "Example A: Query='How do I rotate an API token?' Chunk='API tokens are rotated from Settings > Integrations. "
+    "Generate a new token, update dependent services, then revoke the old token.' "
+    "=> selection_category='ordered_steps', relevance_score=0.95.",
+    "Example B: Query='Why do notifications return 429?' Chunk='HTTP 429 means the rate limit was exceeded; "
+    "reduce request frequency and honor Retry-After.' => selection_category='error_causes', relevance_score=0.92.",
+    "Example C: Query='What services do you provide?' Chunk='Office opening hours are Monday through Friday.' "
+    "=> selection_category='general', relevance_score=0.15, gap='No service evidence in this chunk.'",
+    "",
     "Return ONLY valid JSON with this structure:",
     '{"chunks_ranked": [{"content": "...", "source": "...", "domain_module": "...", '
     '"chunk_index": 0, "cluster_id": "cluster_1", "selection_category": "...", "relevance_score": 0.0, '
     '"relevance_reason": "..."}], "gaps": [...], "relevance_score": 0.0, "summary": "..."}',
     "Sort chunks_ranked from most relevant to least relevant.",
 ]
+
+
+def _selection_limit(query_type_hint: str) -> int:
+    if query_type_hint.upper() in {"PROCEDURAL", "DIAGNOSTIC", "CONFIGURATION"}:
+        return settings.complex_context_selection_limit
+    return settings.context_selection_limit
 
 
 def create_retrieval_agent() -> Agent:
@@ -285,7 +318,7 @@ def _reorder_for_context_selection(
                     near_duplicate_penalty -= 5.0 * strongest_similarity
 
             if query_type == "GENERAL":
-                diversity_bonus = 2.5 if cluster_seen == 0 and len(selected) < SELECTION_CONTEXT_LIMIT else -4.0 * cluster_seen
+                diversity_bonus = 2.5 if cluster_seen == 0 and len(selected) < _selection_limit(query_type) else -4.0 * cluster_seen
                 category_bonus = 2.0 if category_seen == 0 else -2.0 * category_seen
                 source_penalty = -0.5 * source_seen
                 weaker_new_source_penalty = 0.0
@@ -295,7 +328,7 @@ def _reorder_for_context_selection(
                     diversity_bonus = min(diversity_bonus, 0.0)
                     category_bonus = min(category_bonus, 0.0)
             else:
-                diversity_bonus = 6.0 if cluster_seen == 0 and len(selected) < SELECTION_CONTEXT_LIMIT else -4.0 * cluster_seen
+                diversity_bonus = 6.0 if cluster_seen == 0 and len(selected) < _selection_limit(query_type) else -4.0 * cluster_seen
                 category_bonus = 4.0 if category_seen == 0 else -2.0 * category_seen
                 source_penalty = -1.5 * source_seen
                 weaker_new_source_penalty = 0.0
@@ -373,6 +406,126 @@ def _postprocess_retrieval_output(
     return output.model_copy(update={"chunks_ranked": _reorder_for_context_selection(query, query_type_hint, enriched_chunks)})
 
 
+def _infer_deterministic_category(query_type_hint: str, chunk: dict) -> str:
+    if str(chunk.get("domain_module", "")) == "document_profile":
+        return "overview"
+    query_type = query_type_hint.upper()
+    content = f"{chunk.get('domain_module', '')} {chunk.get('content', '')}".lower()
+    if query_type == "PROCEDURAL":
+        if any(marker in content for marker in ("step", "procedure", "workflow", "menu", "path", "passo", "procedura")):
+            return "ordered_steps"
+        return "navigation"
+    if query_type == "DIAGNOSTIC":
+        if any(marker in content for marker in ("error", "cause", "fault", "errore", "causa")):
+            return "error_causes"
+        if any(marker in content for marker in ("check", "verify", "resolution", "resolve", "verifica", "risol")):
+            return "resolution"
+        return "checks"
+    if query_type == "CONFIGURATION":
+        if any(marker in content for marker in ("required", "prerequisite", "must", "requisit")):
+            return "prerequisites"
+        if any(marker in content for marker in ("field", "parameter", "setting", "campo", "parametr")):
+            return "fields"
+        return "settings"
+    if any(marker in content for marker in ("overview", "mission", "azienda", "company", "servizi", "services")):
+        return "overview"
+    return "general"
+
+
+def _score_chunks(query: str, chunks: list[dict]) -> list[tuple[float, int, dict]]:
+    expanded_query = _expand_query_concepts(query)
+    weighted_terms = _build_weighted_query_terms(query, [expanded_query])
+    doc_frequencies: dict[str, int] = {}
+    for chunk in chunks:
+        pseudo_doc = type("PseudoDoc", (), {"page_content": chunk.get("content", ""), "metadata": chunk})()
+        for term in set(_document_terms(pseudo_doc)):
+            doc_frequencies[term] = doc_frequencies.get(term, 0) + 1
+
+    corpus_size = max(1, len(chunks))
+    scored: list[tuple[float, int, dict]] = []
+    for index, chunk in enumerate(chunks):
+        pseudo_doc = type("PseudoDoc", (), {"page_content": chunk.get("content", ""), "metadata": chunk})()
+        lexical_score = _discriminative_document_score(pseudo_doc, weighted_terms, doc_frequencies, corpus_size)
+        if str(chunk.get("domain_module", "")) == "document_profile":
+            lexical_score += float(chunk.get("document_score", 0.0) or 0.0) * 0.35
+        content = str(chunk.get("content", ""))
+        if len(content.strip()) < 35:
+            lexical_score *= 0.25
+        scored.append((lexical_score, index, chunk))
+
+    scored.sort(key=lambda item: (item[0], -item[1]), reverse=True)
+    return scored
+
+
+def _rank_scored_chunks(
+    query: str,
+    query_type_hint: str,
+    scored: list[tuple[float, int, dict]],
+    automatic_clusters: dict[int, str],
+) -> list[RankedChunk]:
+    max_score = max((score for score, _index, _chunk in scored), default=0.0)
+    if max_score <= 0.0:
+        return []
+
+    selected: list[RankedChunk] = []
+    score_floor = max(0.12, max_score * 0.28)
+    for score, index, chunk in scored:
+        if score < score_floor:
+            continue
+        relevance = max(0.25, min(0.92, score / max_score))
+        selected.append(
+            RankedChunk(
+                content=(
+                    chunk.get("content", "")
+                    if len(chunk.get("content", "")) <= 2500
+                    else chunk.get("content", "")[:2500] + "...[TRUNCATED]"
+                ),
+                source=chunk.get("source", "N/A"),
+                domain_module=chunk.get("domain_module", "general"),
+                chunk_index=int(chunk.get("chunk_index", 0)),
+                cluster_id=automatic_clusters.get(index, "cluster_1"),
+                selection_category=_infer_deterministic_category(query_type_hint, chunk),
+                relevance_score=relevance,
+                relevance_reason=f"Deterministic lexical fallback score {score:.2f}.",
+            )
+        )
+        if len(selected) >= _selection_limit(query_type_hint):
+            break
+    return _reorder_for_context_selection(query, query_type_hint, selected)
+
+
+def _fallback_rank_chunks(query: str, chunks: list[dict], automatic_clusters: dict[int, str], query_type_hint: str = "GENERAL") -> list[RankedChunk]:
+    return _rank_scored_chunks(query, query_type_hint, _score_chunks(query, chunks), automatic_clusters)
+
+
+def _fast_context_output(
+    query: str,
+    chunks: list[dict],
+    query_type_hint: str,
+    automatic_clusters: dict[int, str],
+) -> RetrievalOutput | None:
+    if not settings.fast_context_selection:
+        return None
+
+    scored = _score_chunks(query, chunks)
+    max_score = max((score for score, _index, _chunk in scored), default=0.0)
+    if max_score < settings.fast_context_min_score:
+        return None
+
+    ranked_chunks = _rank_scored_chunks(query, query_type_hint, scored, automatic_clusters)
+    if not ranked_chunks:
+        return None
+
+    return RetrievalOutput(
+        chunks_ranked=ranked_chunks,
+        gaps=[],
+        relevance_score=max(chunk.relevance_score for chunk in ranked_chunks),
+        summary="Fast deterministic context selection used high-confidence lexical evidence.",
+        fallback_used=False,
+        fallback_reason=None,
+    )
+
+
 def run_retrieval_agent(
     query: str,
     chunks: list[dict],
@@ -381,8 +534,25 @@ def run_retrieval_agent(
 ) -> RetrievalOutput:
     """Rank chunks and estimate evidence coverage for a query."""
 
-    agent = get_retrieval_agent()
+    if not chunks:
+        return RetrievalOutput(
+            chunks_ranked=[],
+            gaps=["No documentation chunks were retrieved for this query."],
+            relevance_score=0.0,
+            summary="No retrieved chunks available for evidence ranking.",
+        )
+
     automatic_clusters = _cluster_chunks(chunks)
+    fast_output = _fast_context_output(query, chunks, query_type_hint, automatic_clusters)
+    if fast_output is not None:
+        logger.info(
+            "RetrievalAgent fast path: selected %s chunks for %s query.",
+            len(fast_output.chunks_ranked),
+            query_type_hint,
+        )
+        return fast_output
+
+    agent = get_retrieval_agent()
     document_index = _build_document_index(chunks)
     chunks_text = "\n\n".join(
         (
@@ -405,6 +575,15 @@ DOCUMENT INDEX:
 DOCUMENT CHUNKS:
 {chunks_text}
 
+RUNTIME SELECTION RULES:
+- Use the scoring rubric from the system instructions.
+- Select enough category diversity for the query type, not just the first similar chunks.
+- For PROCEDURAL: order categories as prerequisites -> navigation -> ordered_steps -> fields/settings -> constraints.
+- For DIAGNOSTIC: order categories as symptoms -> error_causes -> checks -> resolution -> constraints.
+- For CONFIGURATION: order categories as prerequisites -> permissions -> settings -> fields -> options.
+- For GENERAL: order categories as definitions/overview -> constraints -> timeline/options.
+- If a chunk is only loosely related, score it below 0.45 and explain the gap.
+
 Analyze the chunks and return the evaluation JSON."""
 
     try:
@@ -418,27 +597,13 @@ Analyze the chunks and return the evaluation JSON."""
 
     except Exception as exc:
         logger.error("RetrievalAgent error: %s", exc)
+        fallback_chunks = _fallback_rank_chunks(query, chunks, automatic_clusters, query_type_hint)
+        fallback_score = max((chunk.relevance_score for chunk in fallback_chunks), default=0.0)
         return RetrievalOutput(
-            chunks_ranked=[
-                RankedChunk(
-                    content=(
-                        chunk.get("content", "")
-                        if len(chunk.get("content", "")) <= 500
-                        else chunk.get("content", "")[:500] + "...[TRUNCATED]"
-                    ),
-                    source=chunk.get("source", "N/A"),
-                    domain_module=chunk.get("domain_module", "general"),
-                    chunk_index=int(chunk.get("chunk_index", 0)),
-                    cluster_id=automatic_clusters.get(index, "cluster_1"),
-                    selection_category="general",
-                    relevance_score=0.5,
-                    relevance_reason="Fallback output after retrieval agent failure.",
-                )
-                for index, chunk in enumerate(chunks[:5])
-            ],
-            gaps=["Unable to determine coverage gaps because the retrieval agent failed."],
-            relevance_score=0.5,
-            summary="Fallback retrieval output after agent failure.",
+            chunks_ranked=fallback_chunks,
+            gaps=[] if fallback_chunks else ["No sufficiently relevant documentation chunks were found."],
+            relevance_score=fallback_score,
+            summary="Deterministic lexical fallback retrieval output after agent failure.",
             fallback_used=True,
             fallback_reason="retrieval_agent_error",
         )

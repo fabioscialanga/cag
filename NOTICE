@@ -1,0 +1,17 @@
+CAG Attribution Request
+
+CAG is released under the MIT License (see LICENSE).
+
+The MIT License allows broad reuse and does not require naming a specific author
+beyond preserving license/copyright notices in distributed copies.
+
+If you use CAG in your application, paper, talk, demo, or derivative project,
+we kindly request attribution to:
+
+Fabio Scialanga
+
+Suggested attribution text:
+"Built with CAG by Fabio Scialanga"
+
+Suggested project link:
+https://github.com/fabioscialanga/cag

@@ -16,7 +16,16 @@ from cag.eval.corpus import cleanup_temp_path, collect_benchmark_sources, load_b
 from cag.eval.lightrag_adapter import infer_should_escalate, parse_lightrag_response
 from cag.eval.models import AggregateMetrics, BenchmarkItem, CitationRecord, RunManifest, ScoredResult, SystemOutput
 from cag.eval.scoring import aggregate_results, score_result
-from cag.eval.systems import BaselineGeneration, run_cag_no_selection, run_cag_system, run_rag_baseline, run_system
+from cag.eval.systems import (
+    BaselineGeneration,
+    run_cag_compiled,
+    run_cag_no_selection,
+    run_compiled_only,
+    run_compiled_plus_raw,
+    run_cag_system,
+    run_rag_baseline,
+    run_system,
+)
 
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -31,6 +40,29 @@ def test_load_benchmark_dataset_and_collect_sources():
         "nexus_incident_response_runbook.txt",
         "nexus_platform_configuration_guide.txt",
     ]
+
+
+def test_default_benchmark_preserves_unsupported_question_coverage():
+    items = load_benchmark_dataset()
+    unanswerable_by_type: dict[str, int] = {}
+    for item in items:
+        if not item.answerable:
+            unanswerable_by_type[item.query_type] = unanswerable_by_type.get(item.query_type, 0) + 1
+
+    assert len(items) >= 100
+    assert set(unanswerable_by_type) == {"GENERAL", "PROCEDURAL", "DIAGNOSTIC", "CONFIGURATION"}
+    assert all(count >= 2 for count in unanswerable_by_type.values())
+
+
+def test_default_benchmark_includes_synonym_alias_questions():
+    items = load_benchmark_dataset()
+    alias_items = [item for item in items if "alias/synonym" in item.notes.lower()]
+
+    assert len(alias_items) >= 4
+    assert {item.query_type for item in alias_items} >= {"GENERAL", "PROCEDURAL", "DIAGNOSTIC", "CONFIGURATION"}
+    assert all(item.answerable for item in alias_items)
+    assert all(item.gold_answer_points for item in alias_items)
+    assert all(item.gold_sources for item in alias_items)
 
 
 def test_invalid_benchmark_item_raises_validation_error(tmp_path: Path):
@@ -197,6 +229,7 @@ def test_scoring_covers_supported_and_unsupported_cases():
     supported_score = score_result(answerable_item, supported_output, judge=None)
     assert supported_score.point_coverage == 1.0
     assert supported_score.context_precision_score == 1.0
+    assert supported_score.context_recall_score == 1.0
     assert supported_score.task_success is True
     assert supported_score.hallucination_flag is False
 
@@ -213,6 +246,7 @@ def test_scoring_covers_supported_and_unsupported_cases():
     incomplete_score = score_result(answerable_item, incomplete_output, judge=None)
     assert incomplete_score.point_coverage < 1.0
     assert incomplete_score.context_precision_score == 0.0
+    assert incomplete_score.context_recall_score == 0.0
     assert incomplete_score.task_success is False
 
     unsupported_item = BenchmarkItem(
@@ -235,6 +269,7 @@ def test_scoring_covers_supported_and_unsupported_cases():
     escalation_score = score_result(unsupported_item, escalation_output, judge=None)
     assert escalation_score.task_success is True
     assert escalation_score.context_precision_score is None
+    assert escalation_score.context_recall_score is None
     assert escalation_score.grounded_answer_score == 1.0
 
     hallucinated_output = SystemOutput(
@@ -636,6 +671,7 @@ def test_multi_run_aggregation():
             answerable=True,
             grounded_answer_score=0.8,
             context_precision_score=0.8,
+            context_recall_score=1.0,
             task_success=True,
         )
     ]
@@ -651,6 +687,7 @@ def test_multi_run_aggregation():
             answerable=True,
             grounded_answer_score=0.9,
             context_precision_score=0.6,
+            context_recall_score=0.5,
             task_success=True,
         )
     ]
@@ -664,6 +701,34 @@ def test_multi_run_aggregation():
     assert abs(gas.std - 0.0707) < 0.01
     assert "context_precision_score" in stats
     assert abs(stats["context_precision_score"].mean - 0.7) < 0.001
+    assert "context_recall_score" in stats
+    assert abs(stats["context_recall_score"].mean - 0.75) < 0.001
+
+
+def test_context_recall_scores_multi_source_retrieval_coverage():
+    item = BenchmarkItem(
+        id="multi_source",
+        question="How do I register and configure a webhook?",
+        query_type="PROCEDURAL",
+        gold_answer_points=["POST /api/v1/webhooks", "HTTPS URL"],
+        gold_sources=["nexus_api_reference.txt", "nexus_platform_configuration_guide.txt"],
+        answerable=True,
+    )
+    partial_output = SystemOutput(
+        question_id="multi_source",
+        question=item.question,
+        system="cag",
+        answer="Register the webhook with POST /api/v1/webhooks and provide an HTTPS URL.",
+        citations=[CitationRecord(source="nexus_api_reference.txt", text="...", domain_module="api")],
+        selected_context_sources=["nexus_api_reference.txt"],
+        query_type="PROCEDURAL",
+        should_escalate=False,
+    )
+
+    score = score_result(item, partial_output, judge=None)
+
+    assert score.context_precision_score == 1.0
+    assert score.context_recall_score == 0.5
 
 
 def test_dataset_audit_flags_invalid_items_and_coverage_gaps(tmp_path: Path):
@@ -783,8 +848,71 @@ def test_cag_cli_eval_supports_cag_no_selection():
     assert args.system == "cag_no_selection"
 
 
+def test_cag_cli_eval_supports_cag_compiled():
+    from cag.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["eval", "--system", "cag_compiled"])
+    assert args.system == "cag_compiled"
+
+
+def test_cag_cli_eval_supports_compiled_ablation_systems():
+    from cag.cli import build_parser
+
+    parser = build_parser()
+    assert parser.parse_args(["eval", "--system", "compiled_only"]).system == "compiled_only"
+    assert parser.parse_args(["eval", "--system", "compiled_plus_raw"]).system == "compiled_plus_raw"
+
+
+def test_cag_cli_demo_defaults_to_bundled_corpus():
+    from cag.cli import build_parser
+
+    parser = build_parser()
+    args = parser.parse_args(["demo"])
+
+    assert args.command == "demo"
+    assert args.data_dir == "./data/benchmark_corpus"
+    assert args.query == "What is the minimum RAM required to run Nexus Platform?"
+    assert args.skip_ingest is False
+
+
+def test_cag_cli_demo_runs_ingest_and_query(capsys):
+    from cag.cli import _cmd_demo
+
+    with patch("cag.cli._setup_logging"), patch("cag.ingestion.embedder.main") as mock_ingest, patch(
+        "cag.graph.graph.run_query",
+        return_value={
+            "answer": "Nexus Platform requires at least 8 GB RAM.",
+            "confidence": 0.9,
+            "query_type": "CONFIGURATION",
+            "citations": [{"source": "nexus_platform_configuration_guide.txt"}],
+            "should_escalate": False,
+            "node_trace": ["ENTRY", "RETRIEVE", "SELECT_CONTEXT", "REASON", "VALIDATE", "EXIT"],
+        },
+    ) as mock_run_query:
+        _cmd_demo(
+            SimpleNamespace(
+                data_dir="./data/benchmark_corpus",
+                query="What is the minimum RAM required to run Nexus Platform?",
+                skip_ingest=False,
+                reset=True,
+                json=True,
+            )
+        )
+
+    mock_ingest.assert_called_once_with(["--data-dir", "./data/benchmark_corpus", "--reset"])
+    mock_run_query.assert_called_once_with(
+        query="What is the minimum RAM required to run Nexus Platform?",
+        conversation_history=[],
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["answer"] == "Nexus Platform requires at least 8 GB RAM."
+    assert payload["confidence"] == 0.9
+
+
 def test_run_query_uses_injected_search_function():
     from cag.graph.graph import run_query
+    from cag.graph.runtime import RuntimeConfig
 
     class FakeDoc:
         page_content = "Workflow setup instructions."
@@ -825,10 +953,70 @@ def test_run_query_uses_injected_search_function():
             hallucination_reason="grounded",
         ),
     ):
-        result = run_query("How do I configure the workflow?", search_fn=fake_search)
+        result = run_query(
+            "What is the workflow?",
+            runtime_config=RuntimeConfig(retrieval_top_k=7),
+            search_fn=fake_search,
+        )
 
     assert result["answer"]
     assert calls
+    assert calls[0][1] == 7
+
+
+def test_cag_eval_runner_passes_top_k_to_runtime_config():
+    captured_top_k: list[int] = []
+
+    def search_fn(query: str, k: int):
+        return []
+
+    def fake_query_runner(question: str, conversation_history=None, search_fn=None, runtime_config=None):
+        captured_top_k.append(runtime_config.retrieval_top_k)
+        return {
+            "answer": "Escalated",
+            "citations": [],
+            "query_type": "GENERAL",
+            "confidence": 0.0,
+            "hallucination_risk": 1.0,
+            "should_escalate": True,
+            "fallback_used": False,
+            "fallback_reason": "",
+            "node_trace": ["ENTRY", "RETRIEVE", "VALIDATE", "EXIT"],
+        }
+
+    run_cag_system("q1", "Question", search_fn, top_k=7, query_runner=fake_query_runner)
+
+    assert captured_top_k == [7]
+
+
+def test_eval_run_parser_rejects_non_positive_numbers():
+    from cag.eval.run import build_arg_parser
+
+    parser = build_arg_parser()
+    for option in ["--top-k", "--limit", "--runs"]:
+        with pytest.raises(SystemExit):
+            parser.parse_args(["--system", "cag", option, "0"])
+
+
+def test_settings_accept_lowercase_log_level_and_moderate_threshold():
+    from cag.config import Settings
+
+    settings = Settings(log_level="info", moderate_relevance_threshold=0.42)
+
+    assert settings.log_level == "INFO"
+    assert settings.moderate_relevance_threshold == 0.42
+    assert settings.embedding_tiktoken_enabled is False
+    assert settings.embedding_check_ctx_length is False
+
+
+def test_openai_embeddings_disable_tiktoken_by_default():
+    from cag.ingestion.embedder import get_embeddings
+
+    with patch("langchain_openai.OpenAIEmbeddings") as mock_embeddings:
+        get_embeddings()
+
+    assert mock_embeddings.call_args.kwargs["tiktoken_enabled"] is False
+    assert mock_embeddings.call_args.kwargs["check_embedding_ctx_length"] is False
 
 
 def test_fallback_flags_are_propagated_in_eval_output():
@@ -851,3 +1039,184 @@ def test_fallback_flags_are_propagated_in_eval_output():
     result = run_cag_system("q1", "Question", search_fn, top_k=5, query_runner=fake_query_runner)
     assert result.fallback_used is True
     assert result.fallback_reason == "reasoning_agent_error"
+
+
+def test_cag_compiled_uses_compiled_search_before_raw_search(tmp_path: Path):
+    from cag.knowledge.compiler import compile_chunks
+
+    raw_calls: list[tuple[str, int]] = []
+    compiled_doc = Document(
+        page_content="Checkout latency is high when p95 exceeds 1200 ms.",
+        metadata={"source": "runbook.md", "filename": "runbook.md", "domain_module": "runbook", "chunk_index": 0},
+    )
+    compile_chunks([compiled_doc], tmp_path / "knowledge.db")
+
+    def raw_search(query: str, k: int):
+        raw_calls.append((query, k))
+        return []
+
+    def fake_query_runner(question: str, conversation_history=None, search_fn=None, runtime_config=None):
+        docs = search_fn(question, 5)
+        return {
+            "answer": "Compiled answer",
+            "chunks": [
+                {
+                    "content": doc.page_content,
+                    "source": doc.metadata["filename"],
+                    "domain_module": doc.metadata["domain_module"],
+                    "chunk_index": doc.metadata["chunk_index"],
+                    "compiled_knowledge": bool(doc.metadata.get("compiled_knowledge", False)),
+                }
+                for doc in docs
+            ],
+            "ranked_chunks": [
+                {
+                    "content": doc.page_content,
+                    "source": doc.metadata["filename"],
+                    "domain_module": doc.metadata["domain_module"],
+                    "chunk_index": doc.metadata["chunk_index"],
+                    "relevance_score": 0.9,
+                    "compiled_knowledge": bool(doc.metadata.get("compiled_knowledge", False)),
+                }
+                for doc in docs
+            ],
+            "citations": [],
+            "query_type": "DIAGNOSTIC",
+            "confidence": 0.8,
+            "hallucination_risk": 0.1,
+            "should_escalate": False,
+            "fallback_used": False,
+            "fallback_reason": "",
+            "node_trace": ["ENTRY", "RETRIEVE", "SELECT_CONTEXT", "REASON(retry=0)", "VALIDATE", "EXIT"],
+        }
+
+    result = run_cag_compiled(
+        "q1",
+        "checkout p95 latency",
+        raw_search,
+        top_k=5,
+        query_runner=fake_query_runner,
+        knowledge_db_path=tmp_path / "knowledge.db",
+    )
+
+    assert result.system == "cag_compiled"
+    assert result.retrieved_chunk_count == 1
+    assert result.compiled_chunk_count == 1
+    assert raw_calls == []
+
+
+def test_run_system_dispatches_cag_compiled(tmp_path: Path):
+    def raw_search(query: str, k: int):
+        return []
+
+    with patch("cag.eval.systems.run_cag_compiled") as mock_compiled:
+        mock_compiled.return_value = "compiled-result"
+        result = run_system(
+            "cag_compiled",
+            "q1",
+            "Question",
+            raw_search,
+            top_k=3,
+            runtime={"knowledge_db_path": tmp_path / "knowledge.db"},
+        )
+
+    assert result == "compiled-result"
+    assert mock_compiled.call_args.kwargs["knowledge_db_path"] == tmp_path / "knowledge.db"
+
+
+def test_compiled_only_does_not_call_raw_search(tmp_path: Path):
+    from cag.knowledge.compiler import compile_chunks
+
+    compiled_doc = Document(
+        page_content="Admin access must be reviewed every quarter.",
+        metadata={"source": "policy.md", "filename": "policy.md", "domain_module": "policy", "chunk_index": 0},
+    )
+    compile_chunks([compiled_doc], tmp_path / "knowledge.db")
+
+    def fake_query_runner(question: str, conversation_history=None, search_fn=None, runtime_config=None):
+        docs = search_fn(question, 5)
+        return {
+            "answer": "Compiled only",
+            "chunks": [
+                {
+                    "content": doc.page_content,
+                    "source": doc.metadata["filename"],
+                    "domain_module": doc.metadata["domain_module"],
+                    "chunk_index": doc.metadata["chunk_index"],
+                    "compiled_knowledge": bool(doc.metadata.get("compiled_knowledge", False)),
+                }
+                for doc in docs
+            ],
+            "ranked_chunks": [],
+            "citations": [],
+            "query_type": "GENERAL",
+            "confidence": 0.8,
+            "hallucination_risk": 0.1,
+            "should_escalate": False,
+            "node_trace": ["ENTRY", "RETRIEVE", "SELECT_CONTEXT", "REASON(retry=0)", "VALIDATE", "EXIT"],
+        }
+
+    result = run_compiled_only(
+        "q1",
+        "admin access reviewed quarter",
+        top_k=5,
+        query_runner=fake_query_runner,
+        knowledge_db_path=tmp_path / "knowledge.db",
+    )
+
+    assert result.system == "compiled_only"
+    assert result.retrieved_chunk_count == 1
+    assert result.compiled_chunk_count == 1
+
+
+def test_compiled_plus_raw_merges_compiled_and_raw_results(tmp_path: Path):
+    from cag.knowledge.compiler import compile_chunks
+
+    compiled_doc = Document(
+        page_content="Checkout latency is high when p95 exceeds 1200 ms.",
+        metadata={"source": "runbook.md", "filename": "runbook.md", "domain_module": "runbook", "chunk_index": 0},
+    )
+    raw_doc = Document(
+        page_content="Payment provider status should be checked first.",
+        metadata={"source": "raw_runbook.md", "filename": "raw_runbook.md", "domain_module": "runbook", "chunk_index": 1},
+    )
+    compile_chunks([compiled_doc], tmp_path / "knowledge.db")
+
+    def raw_search(query: str, k: int):
+        return [raw_doc]
+
+    def fake_query_runner(question: str, conversation_history=None, search_fn=None, runtime_config=None):
+        docs = search_fn(question, 5)
+        return {
+            "answer": "Merged",
+            "chunks": [
+                {
+                    "content": doc.page_content,
+                    "source": doc.metadata["filename"],
+                    "domain_module": doc.metadata["domain_module"],
+                    "chunk_index": doc.metadata["chunk_index"],
+                    "compiled_knowledge": bool(doc.metadata.get("compiled_knowledge", False)),
+                }
+                for doc in docs
+            ],
+            "ranked_chunks": [],
+            "citations": [],
+            "query_type": "DIAGNOSTIC",
+            "confidence": 0.8,
+            "hallucination_risk": 0.1,
+            "should_escalate": False,
+            "node_trace": ["ENTRY", "RETRIEVE", "SELECT_CONTEXT", "REASON(retry=0)", "VALIDATE", "EXIT"],
+        }
+
+    result = run_compiled_plus_raw(
+        "q1",
+        "checkout p95 latency payment provider",
+        raw_search,
+        top_k=5,
+        query_runner=fake_query_runner,
+        knowledge_db_path=tmp_path / "knowledge.db",
+    )
+
+    assert result.system == "compiled_plus_raw"
+    assert result.retrieved_chunk_count == 2
+    assert result.compiled_chunk_count == 1

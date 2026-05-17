@@ -14,6 +14,7 @@ class RuntimeConfig(BaseModel):
     relevance_threshold: float = Field(default_factory=lambda: settings.relevance_threshold, ge=0.0, le=1.0)
     confidence_threshold: float = Field(default_factory=lambda: settings.confidence_threshold, ge=0.0, le=1.0)
     hallucination_threshold: float = Field(default_factory=lambda: settings.hallucination_threshold, ge=0.0, le=1.0)
+    retrieval_top_k: int = Field(default_factory=lambda: settings.retrieval_top_k, ge=1, le=50)
 
 
 def resolve_runtime_config(runtime_config: RuntimeConfig | None = None) -> RuntimeConfig:

@@ -5,6 +5,7 @@ Provides the ``cag`` console command with subcommands:
 
     cag ingest   -- run the ingestion pipeline
     cag query    -- run a single query against the CAG graph
+    cag demo     -- ingest the bundled demo corpus and run a sample query
     cag eval     -- run a benchmark evaluation
     cag eval-audit -- inspect benchmark dataset readiness
     cag compare  -- compare benchmark run artifacts
@@ -44,6 +45,10 @@ def _cmd_query(args: argparse.Namespace) -> None:
     from cag.graph.graph import run_query
 
     result = run_query(query=args.query, conversation_history=[])
+    _print_query_result(result, as_json=args.json)
+
+
+def _print_query_result(result: dict, as_json: bool = False) -> None:
     output = {
         "answer": result.get("answer", ""),
         "confidence": result.get("confidence", 0.0),
@@ -52,7 +57,7 @@ def _cmd_query(args: argparse.Namespace) -> None:
         "should_escalate": result.get("should_escalate", False),
         "node_trace": result.get("node_trace", []),
     }
-    if args.json:
+    if as_json:
         print(json.dumps(output, indent=2, ensure_ascii=False))
     else:
         print(output["answer"])
@@ -61,6 +66,21 @@ def _cmd_query(args: argparse.Namespace) -> None:
             print(f"\nSources: {sources}")
         if output["should_escalate"]:
             print("\n[ESCALATION RECOMMENDED]")
+
+
+def _cmd_demo(args: argparse.Namespace) -> None:
+    _setup_logging()
+    from cag.graph.graph import run_query
+    from cag.ingestion.embedder import main as ingest_main
+
+    if not args.skip_ingest:
+        ingest_argv = ["--data-dir", args.data_dir]
+        if args.reset:
+            ingest_argv.append("--reset")
+        ingest_main(ingest_argv)
+
+    result = run_query(query=args.query, conversation_history=[])
+    _print_query_result(result, as_json=args.json)
 
 
 def _cmd_eval(args: argparse.Namespace) -> None:
@@ -137,11 +157,33 @@ def build_parser() -> argparse.ArgumentParser:
     query_parser.add_argument("--json", action="store_true", help="Output as JSON")
     query_parser.set_defaults(func=_cmd_query)
 
+    # --- cag demo ---
+    demo_parser = subparsers.add_parser("demo", help="Run a local demo against the bundled benchmark corpus")
+    demo_parser.add_argument("--data-dir", default="./data/benchmark_corpus", help="Directory containing demo documents")
+    demo_parser.add_argument(
+        "--query",
+        default="What is the minimum RAM required to run Nexus Platform?",
+        help="Question to ask after demo ingestion",
+    )
+    demo_parser.add_argument("--skip-ingest", action="store_true", help="Use the existing vector index without ingesting first")
+    demo_parser.add_argument("--reset", action="store_true", help="Reset the vector store before demo ingestion")
+    demo_parser.add_argument("--json", action="store_true", help="Output as JSON")
+    demo_parser.set_defaults(func=_cmd_demo)
+
     # --- cag eval ---
     eval_parser = subparsers.add_parser("eval", help="Run a benchmark evaluation")
     eval_parser.add_argument(
         "--system",
-        choices=["cag", "cag_no_selection", "rag_baseline", "direct_baseline", "lightrag_baseline"],
+        choices=[
+            "cag",
+            "cag_compiled",
+            "compiled_only",
+            "compiled_plus_raw",
+            "cag_no_selection",
+            "rag_baseline",
+            "direct_baseline",
+            "lightrag_baseline",
+        ],
         required=True,
     )
     eval_parser.add_argument("--dataset", default=None, help="Path to benchmark JSONL dataset")

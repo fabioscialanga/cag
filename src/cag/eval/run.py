@@ -24,6 +24,13 @@ from cag.eval.systems import run_system
 logger = logging.getLogger(__name__)
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
+
+
 def _write_results(path: Path, results: list[ScoredResult]) -> None:
     with path.open("w", encoding="utf-8") as handle:
         for result in results:
@@ -34,15 +41,24 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the CAG scientific benchmark.")
     parser.add_argument(
         "--system",
-        choices=["cag", "cag_no_selection", "rag_baseline", "direct_baseline", "lightrag_baseline"],
+        choices=[
+            "cag",
+            "cag_compiled",
+            "compiled_only",
+            "compiled_plus_raw",
+            "cag_no_selection",
+            "rag_baseline",
+            "direct_baseline",
+            "lightrag_baseline",
+        ],
         required=True,
     )
     parser.add_argument("--dataset", default=None, help="Path to the benchmark JSONL dataset.")
     parser.add_argument("--data-dir", default="./data/benchmark_corpus", help="Directory containing source documents. Default: benchmark corpus.")
     parser.add_argument("--judge-mode", choices=["auto", "off", "required"], default="auto")
-    parser.add_argument("--top-k", type=int, default=settings.retrieval_top_k)
-    parser.add_argument("--limit", type=int, default=None, help="Run only the first N benchmark items.")
-    parser.add_argument("--runs", type=int, default=1, help="Run the benchmark N times for stochastic reproducibility.")
+    parser.add_argument("--top-k", type=_positive_int, default=settings.retrieval_top_k)
+    parser.add_argument("--limit", type=_positive_int, default=None, help="Run only the first N benchmark items.")
+    parser.add_argument("--runs", type=_positive_int, default=1, help="Run the benchmark N times for stochastic reproducibility.")
     parser.add_argument("--output-dir", default="./artifacts/eval_runs", help="Base directory for run artifacts.")
     return parser
 
@@ -76,6 +92,14 @@ def _run_single_pass(
                 results.append(score_result(item, raw_result, judge=judge))
     else:
         with BenchmarkVectorIndex(data_dir, benchmark_items).build() as index:
+            runtime = None
+            if system in {"cag_compiled", "compiled_only", "compiled_plus_raw"}:
+                from cag.knowledge.compiler import compile_chunks
+
+                knowledge_db_path = run_dir / "knowledge.db"
+                compile_chunks(index.chunks, knowledge_db_path)
+                runtime = {"knowledge_db_path": knowledge_db_path}
+
             for item in benchmark_items:
                 logger.info("Benchmarking %s on %s", item.id, system)
                 raw_result = run_system(
@@ -84,6 +108,7 @@ def _run_single_pass(
                     question=item.question,
                     search_fn=index.similarity_search,
                     top_k=top_k,
+                    runtime=runtime,
                 )
                 results.append(score_result(item, raw_result, judge=judge))
 
@@ -118,7 +143,7 @@ def _compute_multi_run_stats(all_runs: list[list[ScoredResult]]) -> dict[str, Me
     per_run_metrics = [aggregate_results(run) for run in all_runs]
     metric_names = [
         "grounded_answer_score", "point_coverage", "source_grounding", "context_precision_score",
-        "hallucination_rate", "task_success_rate", "false_escalation_rate",
+        "context_recall_score", "hallucination_rate", "task_success_rate", "false_escalation_rate",
         "avg_latency_ms", "avg_cost_estimate",
     ]
 
@@ -161,7 +186,7 @@ def _compute_multi_run_by_type(
 
         metric_names = [
             "grounded_answer_score", "point_coverage", "source_grounding", "context_precision_score",
-            "hallucination_rate", "task_success_rate",
+            "context_recall_score", "hallucination_rate", "task_success_rate",
         ]
         type_stats: dict[str, MetricStats] = {}
         for name in metric_names:
@@ -191,7 +216,7 @@ def main(argv=None) -> None:
 
     benchmark_items = load_benchmark_dataset(args.dataset)
     dataset_path = str(args.dataset or "package://cag.eval/benchmark_dataset.jsonl")
-    if args.limit:
+    if args.limit is not None:
         benchmark_items = benchmark_items[: args.limit]
 
     judge = build_judge(args.judge_mode)

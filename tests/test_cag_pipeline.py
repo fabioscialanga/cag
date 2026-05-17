@@ -16,10 +16,14 @@ from cag.agents.retrieval_agent import (
     _normalize_category,
     _postprocess_retrieval_output,
     _reorder_for_context_selection,
+    run_retrieval_agent,
 )
 from cag.graph.nodes import (
+    _dedupe_documents,
+    contextualize_query_node,
     entry_node,
     exit_node,
+    post_grounding_node,
     reason_node,
     select_context_node,
     retrieve_node,
@@ -34,10 +38,16 @@ from cag.graph.state import CAGState
 def base_state() -> CAGState:
     return {
         "query": "What prerequisites are required before using the onboarding workflow?",
+        "original_query": "What prerequisites are required before using the onboarding workflow?",
+        "modified_query": "What prerequisites are required before using the onboarding workflow?",
         "question_scope": "domain",
         "retrieval_strategy": "semantic",
+        "intent": {},
+        "retrieval_plan": {},
+        "access_filter": {},
         "chunks": [],
         "ranked_chunks": [],
+        "document_candidates": [],
         "gaps": [],
         "relevance_score": 0.0,
         "answer": "",
@@ -48,11 +58,20 @@ def base_state() -> CAGState:
         "response_language": "en",
         "should_escalate": False,
         "should_retry_reason": False,
+        "should_retry_retrieval": False,
+        "retrieval_retry_used": False,
         "reason_retries": 0,
         "error_message": "",
         "retry_guidance": "",
+        "fallback_used": False,
+        "fallback_reason": "",
+        "grounding_checks": [],
+        "unsupported_claims": [],
+        "post_grounding_status": "pending",
+        "suggested_actions": [],
         "node_trace": [],
         "conversation_history": [],
+        "retrieval_top_k": 20,
     }
 
 
@@ -141,11 +160,23 @@ class TestEntryNode:
         result = entry_node(state)
         assert result["response_language"] == "it"
 
+    def test_infers_italian_for_short_hr_question(self, base_state):
+        state = {**base_state, "query": "come posso gestire le risorse umane?"}
+        result = entry_node(state)
+        assert result["response_language"] == "it"
+
     def test_resets_runtime_fields(self, base_state):
         result = entry_node(base_state)
         assert result["chunks"] == []
         assert result["answer"] == ""
         assert result["should_escalate"] is False
+
+    def test_builds_explicit_intent_and_retrieval_plan(self, base_state):
+        result = entry_node(base_state)
+        assert result["modified_query"] == base_state["query"]
+        assert result["intent"]["query_type"] == "CONFIGURATION"
+        assert result["retrieval_plan"]["strategy"] == "semantic"
+        assert "document_profiles" in result["retrieval_plan"]["sources"]
 
 
 class TestRetrieveNode:
@@ -154,7 +185,10 @@ class TestRetrieveNode:
         mock_doc.page_content = "Workflow setup content"
         mock_doc.metadata = {"filename": "team_handbook_setup.txt", "domain_module": "workflow", "chunk_index": 0}
 
-        with patch("cag.graph.nodes.similarity_search", return_value=[mock_doc]):
+        with (
+            patch("cag.graph.nodes.search_document_profiles", return_value=[]),
+            patch("cag.graph.nodes.similarity_search", return_value=[mock_doc]),
+        ):
             result = retrieve_node(base_state)
 
         assert len(result["chunks"]) == 1
@@ -162,15 +196,371 @@ class TestRetrieveNode:
         assert result["chunks"][0]["domain_module"] == "workflow"
         assert "RETRIEVE" in result["node_trace"]
 
+    def test_retrieve_preserves_compiled_knowledge_metadata(self, base_state):
+        mock_doc = MagicMock()
+        mock_doc.page_content = "Compiled claim content"
+        mock_doc.metadata = {
+            "filename": "claims.txt",
+            "domain_module": "knowledge",
+            "chunk_index": 3,
+            "compiled_knowledge": True,
+            "claim_id": "claim-1",
+            "chunk_id": "chunk-1",
+        }
+
+        with (
+            patch("cag.graph.nodes.search_document_profiles", return_value=[]),
+            patch("cag.graph.nodes.similarity_search", return_value=[mock_doc]),
+        ):
+            result = retrieve_node(base_state)
+
+        assert result["chunks"][0]["compiled_knowledge"] is True
+        assert result["chunks"][0]["claim_id"] == "claim-1"
+        assert result["chunks"][0]["knowledge_chunk_id"] == "chunk-1"
+
     def test_handles_vector_store_errors(self, base_state):
-        with patch("cag.graph.nodes.similarity_search", side_effect=Exception("Vector store unavailable")):
+        with (
+            patch("cag.graph.nodes.search_document_profiles", return_value=[]),
+            patch("cag.graph.nodes.similarity_search", side_effect=Exception("Vector store unavailable")),
+        ):
             result = retrieve_node(base_state)
 
         assert result["chunks"] == []
         assert "RETRIEVE" in result["node_trace"]
 
+    def test_retrieve_uses_document_map_before_global_search(self, base_state):
+        from langchain_core.documents import Document
+
+        candidate = {
+            "profile_id": "profile-1",
+            "source_version_id": "version-1",
+            "filename": "company_overview.txt",
+            "source": "company_overview.txt",
+            "summary": "Company overview content from the document profile.",
+            "score": 4.0,
+            "match_reason": "Matched profile terms: company",
+            "generator": "llm",
+        }
+        doc = Document(
+            page_content="Company overview content",
+            metadata={
+                "filename": "company_overview.txt",
+                "source": "company_overview.txt",
+                "domain_module": "company",
+                "chunk_index": 0,
+                "document_profile_id": "profile-1",
+                "document_score": 4.0,
+                "document_match_reason": "Matched profile terms: company",
+                "document_profile_generator": "llm",
+            },
+        )
+
+        with (
+            patch("cag.graph.nodes.search_document_profiles", return_value=[candidate]) as mock_profiles,
+            patch("cag.graph.nodes.search_chunks_for_document_candidates", return_value=[doc]) as mock_doc_chunks,
+            patch("cag.graph.nodes.similarity_search") as mock_global_search,
+        ):
+            result = retrieve_node({**base_state, "query": "Ciao di cosa vi occupate?"})
+
+        assert result["document_candidates"] == [candidate]
+        assert result["chunks"][0]["source"] == "company_overview.txt"
+        assert result["chunks"][0]["content"] == "Company overview content from the document profile."
+        assert result["chunks"][0]["document_profile_generator"] == "llm"
+        mock_profiles.assert_called_once()
+        mock_doc_chunks.assert_called_once()
+        mock_global_search.assert_not_called()
+
+    def test_procedural_retrieve_requests_neighbor_chunks(self, base_state):
+        from langchain_core.documents import Document
+
+        candidate = {
+            "profile_id": "profile-1",
+            "source_version_id": "version-1",
+            "filename": "runbook.txt",
+            "source": "runbook.txt",
+            "summary": "Runbook procedure.",
+            "score": 4.0,
+            "match_reason": "Matched profile terms: runbook",
+            "generator": "llm",
+        }
+        doc = Document(
+            page_content="Rotate the API token from the credentials panel.",
+            metadata={"filename": "runbook.txt", "domain_module": "runbook", "chunk_index": 1},
+        )
+
+        with (
+            patch("cag.graph.nodes.search_document_profiles", return_value=[candidate]),
+            patch("cag.graph.nodes.search_chunks_for_document_candidates", return_value=[doc]) as mock_doc_chunks,
+            patch("cag.graph.nodes.similarity_search"),
+        ):
+            retrieve_node(
+                {
+                    **base_state,
+                    "query": "How do I rotate the API token?",
+                    "query_type": "PROCEDURAL",
+                    "retrieval_strategy": "hierarchical",
+                }
+            )
+
+        assert mock_doc_chunks.call_args.kwargs["include_neighbors"] is True
+
+    def test_select_context_preserves_document_profile_score(self, base_state):
+        state = {
+            **base_state,
+            "chunks": [
+                {
+                    "content": "Company overview content from the document profile.",
+                    "source": "company_overview.txt",
+                    "domain_module": "document_profile",
+                    "chunk_index": -1,
+                    "document_score": 2.4,
+                }
+            ],
+        }
+        retrieval_output = RetrievalOutput(
+            chunks_ranked=[
+                RankedChunk(
+                    content="Company overview content from the document profile.",
+                    source="company_overview.txt",
+                    domain_module="document_profile",
+                    chunk_index=-1,
+                    selection_category="overview",
+                    relevance_score=0.32,
+                    relevance_reason="Overview profile evidence.",
+                )
+            ],
+            gaps=[],
+            relevance_score=0.32,
+            summary="Profile overview.",
+        )
+
+        with patch("cag.graph.nodes.run_retrieval_agent", return_value=retrieval_output):
+            result = select_context_node(state)
+
+        assert result["ranked_chunks"][0]["document_score"] == 2.4
+
+    def test_retrieve_falls_back_to_global_search_without_document_candidates(self, base_state):
+        mock_doc = MagicMock()
+        mock_doc.page_content = "Workflow setup content"
+        mock_doc.metadata = {"filename": "workflow.txt", "domain_module": "workflow", "chunk_index": 0}
+
+        with (
+            patch("cag.graph.nodes.search_document_profiles", return_value=[]),
+            patch("cag.graph.nodes.similarity_search", return_value=[mock_doc]) as mock_global_search,
+        ):
+            result = retrieve_node(base_state)
+
+        assert result["document_candidates"] == []
+        assert result["chunks"][0]["source"] == "workflow.txt"
+        assert mock_global_search.called
+
+    def test_retrieve_merges_hybrid_lexical_candidates(self, base_state):
+        from cag.config import settings
+
+        vector_doc = MagicMock()
+        vector_doc.page_content = "Vector result about workflow ownership."
+        vector_doc.metadata = {"filename": "vector.txt", "domain_module": "workflow", "chunk_index": 0}
+
+        lexical_doc = MagicMock()
+        lexical_doc.page_content = "Lexical result about SAML certificate rotation."
+        lexical_doc.metadata = {"filename": "lexical.txt", "domain_module": "security", "chunk_index": 1}
+
+        with (
+            patch("cag.graph.nodes.search_document_profiles", return_value=[]),
+            patch("cag.graph.nodes.similarity_search", return_value=[vector_doc]),
+            patch("cag.graph.nodes.lexical_file_search", return_value=[lexical_doc]) as mock_lexical,
+            patch.object(settings, "hybrid_lexical_retrieval", True),
+            patch.object(settings, "hybrid_lexical_top_k", 5),
+        ):
+            result = retrieve_node(base_state)
+
+        sources = {chunk["source"] for chunk in result["chunks"]}
+        assert "vector.txt" in sources
+        assert "lexical.txt" in sources
+        mock_lexical.assert_called_once()
+
+    def test_retrieve_applies_allowed_source_boundary(self, base_state):
+        from langchain_core.documents import Document
+
+        allowed_doc = Document(
+            page_content="Allowed workflow content",
+            metadata={"filename": "allowed.txt", "domain_module": "workflow", "chunk_index": 0},
+        )
+        blocked_doc = Document(
+            page_content="Blocked payroll content",
+            metadata={"filename": "blocked.txt", "domain_module": "payroll", "chunk_index": 0},
+        )
+
+        with (
+            patch("cag.graph.nodes.search_document_profiles", return_value=[]),
+            patch("cag.graph.nodes.similarity_search", return_value=[blocked_doc, allowed_doc]),
+        ):
+            result = retrieve_node({**base_state, "access_filter": {"allowed_sources": ["allowed.txt"]}})
+
+        assert [chunk["source"] for chunk in result["chunks"]] == ["allowed.txt"]
+        assert result["retrieval_plan"]["access_filter_applied"] is True
+
+    def test_retrieve_denies_missing_workspace_metadata_when_filter_is_explicit(self, base_state):
+        from langchain_core.documents import Document
+
+        public_doc = Document(
+            page_content="Unscoped content",
+            metadata={"filename": "unscoped.txt", "domain_module": "workflow", "chunk_index": 0},
+        )
+
+        with (
+            patch("cag.graph.nodes.search_document_profiles", return_value=[]),
+            patch("cag.graph.nodes.similarity_search", return_value=[public_doc]),
+        ):
+            result = retrieve_node({**base_state, "access_filter": {"workspace_id": "tenant-a"}})
+
+        assert result["chunks"] == []
+        assert result["retrieval_plan"]["access_filter_applied"] is True
+
+    def test_deduped_results_prefer_discriminative_terms(self):
+        common_doc = MagicMock()
+        common_doc.page_content = "Workflow workflow workflow setup overview for general usage."
+        common_doc.metadata = {"filename": "workflow_overview.txt", "domain_module": "workflow", "chunk_index": 0}
+
+        specific_doc = MagicMock()
+        specific_doc.page_content = "Configure SAML certificate rotation for the workflow."
+        specific_doc.metadata = {"filename": "saml_certificate.txt", "domain_module": "security", "chunk_index": 0}
+
+        repeated_common_doc = MagicMock()
+        repeated_common_doc.page_content = "Workflow setup checklist and owner assignment."
+        repeated_common_doc.metadata = {"filename": "workflow_checklist.txt", "domain_module": "workflow", "chunk_index": 0}
+
+        results = _dedupe_documents(
+            "How do I configure SAML certificate rotation?",
+            [common_doc, repeated_common_doc, specific_doc],
+            ["configure saml certificate rotation", "configuration saml certificate"],
+        )
+
+        assert results[0].metadata["filename"] == "saml_certificate.txt"
+
+    def test_deduped_results_preserve_vector_order_as_secondary_signal(self):
+        first_doc = MagicMock()
+        first_doc.page_content = "Workflow owner overview."
+        first_doc.metadata = {"filename": "first.txt", "domain_module": "workflow", "chunk_index": 0}
+
+        second_doc = MagicMock()
+        second_doc.page_content = "Workflow owner overview."
+        second_doc.metadata = {"filename": "second.txt", "domain_module": "workflow", "chunk_index": 0}
+
+        results = _dedupe_documents("workflow owner", [first_doc, second_doc])
+
+        assert [doc.metadata["filename"] for doc in results] == ["first.txt", "second.txt"]
+
+
+class TestContextualizeQueryNode:
+    def test_contextualizes_vague_followup_with_previous_answer(self, base_state):
+        state = {
+            **base_state,
+            "query": "spiegami meglio come potete esserci di aiuto",
+            "original_query": "spiegami meglio come potete esserci di aiuto",
+            "modified_query": "spiegami meglio come potete esserci di aiuto",
+            "response_language": "it",
+            "intent": {"query_type": "GENERAL"},
+            "retrieval_plan": {"sources": ["document_profiles"]},
+            "conversation_history": [
+                {"role": "user", "content": "Ciao di cosa vi occupate?"},
+                {
+                    "role": "assistant",
+                    "content": (
+                        "Siamo un partner tecnologico con soluzioni TeamSystem, "
+                        "infrastrutture IT, networking, cloud, CRM, sicurezza informatica, "
+                        "data integration e sviluppo software."
+                    ),
+                },
+                {"role": "user", "content": "spiegami meglio come potete esserci di aiuto"},
+            ],
+            "node_trace": ["ENTRY"],
+        }
+
+        result = contextualize_query_node(state)
+
+        assert result["query"] != state["query"]
+        assert "teamsystem" in result["query"].lower()
+        assert "cloud" in result["query"].lower()
+        assert result["modified_query"] == result["query"]
+        assert result["intent"]["conversation_contextualized"] is True
+        assert result["retrieval_plan"]["conversation_contextualized"] is True
+        assert "CONTEXTUALIZE_QUERY" in result["node_trace"]
+
+    def test_leaves_standalone_question_unchanged(self, base_state):
+        state = {
+            **base_state,
+            "query": "Quali sedi avete?",
+            "conversation_history": [
+                {"role": "assistant", "content": "Siamo un partner tecnologico."},
+            ],
+            "node_trace": ["ENTRY"],
+        }
+
+        result = contextualize_query_node(state)
+
+        assert "query" not in result
+        assert result["node_trace"] == ["ENTRY", "CONTEXTUALIZE_QUERY"]
+
 
 class TestSelectContextNode:
+    def test_retrieval_agent_short_circuits_empty_chunks(self):
+        with patch("cag.agents.retrieval_agent.get_retrieval_agent") as mock_get_agent:
+            result = run_retrieval_agent("What does the document say?", [])
+
+        assert result.chunks_ranked == []
+        assert result.relevance_score == 0.0
+        assert result.gaps == ["No documentation chunks were retrieved for this query."]
+        mock_get_agent.assert_not_called()
+
+    def test_retrieval_agent_uses_fast_path_for_strong_local_evidence(self):
+        chunks = [
+            {
+                "content": (
+                    "Studio 81 supports companies with TeamSystem solutions, cloud services, "
+                    "CRM, cybersecurity, networking, data integration, and custom software."
+                ),
+                "source": "studio81_services.txt",
+                "domain_module": "services",
+                "chunk_index": 0,
+            },
+            {
+                "content": "Contact details and office opening hours.",
+                "source": "contacts.txt",
+                "domain_module": "contact",
+                "chunk_index": 0,
+            },
+        ]
+
+        with patch("cag.agents.retrieval_agent.get_retrieval_agent") as mock_get_agent:
+            result = run_retrieval_agent(
+                "TeamSystem cloud CRM cybersecurity networking data integration software",
+                chunks,
+                query_type_hint="GENERAL",
+            )
+
+        assert result.chunks_ranked
+        assert result.chunks_ranked[0].source == "studio81_services.txt"
+        assert result.relevance_score >= 0.9
+        assert result.fallback_used is False
+        mock_get_agent.assert_not_called()
+
+    def test_deduped_results_handle_typoed_application_development_query(self):
+        weak_doc = MagicMock()
+        weak_doc.page_content = "Studio 81 lists contact information and office locations."
+        weak_doc.metadata = {"filename": "contacts.txt", "domain_module": "contact", "chunk_index": 0}
+
+        app_doc = MagicMock()
+        app_doc.page_content = (
+            "Studio 81 provides software development, custom applications, CRM, "
+            "data integration, digital marketing, and website services."
+        )
+        app_doc.metadata = {"filename": "software_services.txt", "domain_module": "services", "chunk_index": 0}
+
+        results = _dedupe_documents("svilupppate applicazioni?", [weak_doc, app_doc])
+
+        assert results[0].metadata["filename"] == "software_services.txt"
+
     def test_ranks_chunks(self, base_state, mock_retrieval_output):
         state = {**base_state, "chunks": [{"content": "Workflow docs"}], "node_trace": ["ENTRY", "RETRIEVE"]}
 
@@ -202,6 +592,7 @@ class TestReasonNode:
         assert result["confidence"] == 0.88
         assert result["hallucination_risk"] == 0.08
         assert result["reason_retries"] == 1
+        assert "REVIEW" in result["node_trace"]
 
     def test_preserves_graph_inferred_query_type(self, base_state, mock_reasoning_output):
         state = {
@@ -232,6 +623,320 @@ class TestReasonNode:
         assert result["should_retry_reason"] is False
         assert result["retry_guidance"] == ""
         assert mock_reason.call_args.kwargs["retry_guidance"] == "Use only the strongest evidence."
+
+    def test_reasoning_agent_returns_evidence_only_fallback_when_model_fails(self):
+        from cag.agents.reasoning_agent import run_reasoning_agent
+
+        ranked_chunks = [
+            {
+                "content": "NexusFlow helps support teams triage incidents and coordinate customer communication.",
+                "source": "nexus_overview.txt",
+                "domain_module": "nexus",
+                "chunk_index": 0,
+                "relevance_score": 0.86,
+            }
+        ]
+
+        with patch("cag.agents.reasoning_agent.get_reasoning_agent", side_effect=RuntimeError("offline")):
+            output = run_reasoning_agent(
+                query="Ciao di cosa vi occupate?",
+                ranked_chunks=ranked_chunks,
+                gaps=[],
+                response_language="it",
+            )
+
+        assert "NexusFlow" in output.answer
+        assert output.citations[0].source == "nexus_overview.txt"
+        assert output.fallback_used is True
+        assert output.fallback_reason == "reasoning_model_unavailable_evidence_only"
+        assert output.hallucination_risk < 0.3
+
+    def test_reasoning_agent_fallback_avoids_short_broken_overview_fragments(self):
+        from cag.agents.reasoning_agent import run_reasoning_agent
+
+        ranked_chunks = [
+            {
+                "content": "prodotti e servizi nel campo dell'Information Technology, con particolare focus sulle",
+                "source": "studio81.pdf",
+                "domain_module": "studio81",
+                "chunk_index": 0,
+                "relevance_score": 0.86,
+            },
+            {
+                "content": (
+                    "Studio 81 Data Systems presenta l'azienda, i prodotti e i servizi nel campo "
+                    "dell'Information Technology, con particolare focus sulle soluzioni TeamSystem, "
+                    "tecnologie innovative e infrastrutture IT."
+                ),
+                "source": "studio81.pdf",
+                "domain_module": "document_profile",
+                "chunk_index": -1,
+                "relevance_score": 0.85,
+            },
+        ]
+
+        with patch("cag.agents.reasoning_agent.get_reasoning_agent", side_effect=RuntimeError("offline")):
+            output = run_reasoning_agent(
+                query="Ciao di cosa vi occupate?",
+                ranked_chunks=ranked_chunks,
+                gaps=[],
+                response_language="it",
+            )
+
+        assert "tecnologie innovative" in output.answer
+        assert "particolare focus sulle" in output.answer
+        assert output.answer.strip() != "prodotti e servizi nel campo dell'Information Technology, con particolare focus sulle"
+
+    def test_reasoning_agent_fallback_formats_evidence_as_answer(self):
+        from cag.agents.reasoning_agent import run_reasoning_agent
+
+        ranked_chunks = [
+            {
+                "content": (
+                    "NexusFlow is a platform for support teams. "
+                    "It helps teams triage incidents and coordinate customer communication."
+                ),
+                "source": "nexus_overview.txt",
+                "domain_module": "nexus",
+                "chunk_index": 0,
+                "relevance_score": 0.9,
+            },
+            {
+                "content": (
+                    "NexusFlow also tracks response ownership across support teams, "
+                    "so teams can keep customer communication coordinated during incidents."
+                ),
+                "source": "nexus_overview.txt",
+                "domain_module": "nexus",
+                "chunk_index": 1,
+                "relevance_score": 0.89,
+            },
+        ]
+
+        with patch("cag.agents.reasoning_agent.get_reasoning_agent", side_effect=RuntimeError("offline")):
+            output = run_reasoning_agent(
+                query="What does NexusFlow do?",
+                ranked_chunks=ranked_chunks,
+                gaps=[],
+                response_language="en",
+            )
+
+        assert output.answer.startswith("From the recovered documentation:")
+        assert "support teams" in output.answer
+        assert "- " in output.answer
+        assert output.answer != " ".join(citation.text for citation in output.citations)
+
+    def test_reasoning_agent_fallback_uses_more_than_nearly_identical_top_chunks(self):
+        from cag.agents.reasoning_agent import run_reasoning_agent
+
+        ranked_chunks = [
+            {
+                "content": "Studio 81 provides consulting for TeamSystem products and business software projects.",
+                "source": "studio81.pdf",
+                "domain_module": "profile",
+                "chunk_index": 0,
+                "relevance_score": 0.92,
+            },
+            {
+                "content": "The company supports IT infrastructure, networking, security, and cloud services for customers.",
+                "source": "it-infrastructure.pdf",
+                "domain_module": "services",
+                "chunk_index": 0,
+                "relevance_score": 0.76,
+            },
+            {
+                "content": "Studio 81 also offers operational support and assistance around installed solutions.",
+                "source": "support.pdf",
+                "domain_module": "support",
+                "chunk_index": 0,
+                "relevance_score": 0.72,
+            },
+        ]
+
+        with patch("cag.agents.reasoning_agent.get_reasoning_agent", side_effect=RuntimeError("offline")):
+            output = run_reasoning_agent(
+                query="Di cosa vi occupate?",
+                ranked_chunks=ranked_chunks,
+                gaps=[],
+                response_language="it",
+            )
+
+        assert "TeamSystem" in output.answer
+        assert "networking" in output.answer
+        assert "support" in output.answer.lower() or "assistenza" in output.answer.lower()
+        assert len(output.citations) >= 3
+
+    def test_reasoning_agent_enriches_thin_model_answers(self):
+        from cag.agents.reasoning_agent import run_reasoning_agent
+
+        class FakeAgent:
+            def run(self, _prompt):
+                class Response:
+                    content = ReasoningOutput(
+                        answer="Studio 81 si occupa di servizi IT.",
+                        query_type="GENERAL",
+                        confidence=0.5,
+                        citations=[],
+                        hallucination_risk=0.1,
+                        hallucination_reason="Thin answer from model.",
+                    )
+
+                return Response()
+
+        ranked_chunks = [
+            {
+                "content": "Studio 81 provides consulting for TeamSystem products and business software projects.",
+                "source": "studio81.pdf",
+                "domain_module": "profile",
+                "chunk_index": 0,
+                "relevance_score": 0.92,
+            },
+            {
+                "content": "The company supports IT infrastructure, networking, security, and cloud services for customers.",
+                "source": "it-infrastructure.pdf",
+                "domain_module": "services",
+                "chunk_index": 0,
+                "relevance_score": 0.78,
+            },
+        ]
+
+        with patch("cag.agents.reasoning_agent.get_reasoning_agent", return_value=FakeAgent()):
+            output = run_reasoning_agent(
+                query="Di cosa vi occupate?",
+                ranked_chunks=ranked_chunks,
+                gaps=[],
+                response_language="it",
+            )
+
+        assert "Dettagli supportati" in output.answer
+        assert "TeamSystem" in output.answer
+        assert "networking" in output.answer
+        assert output.confidence >= 0.62
+
+    def test_reasoning_agent_does_not_enrich_complete_address_answer(self):
+        from cag.agents.reasoning_agent import run_reasoning_agent
+
+        answer = (
+            "Studio 81 Data Systems opera in Italia con sedi a Roma, Lazio, "
+            "in Via Cornelia n. 498, e a Napoli, Campania, in Via Benedetto Brin 63/Piano 2."
+        )
+
+        class FakeAgent:
+            def run(self, _prompt):
+                class Response:
+                    content = ReasoningOutput(
+                        answer=answer,
+                        query_type="GENERAL",
+                        confidence=0.72,
+                        citations=[],
+                        hallucination_risk=0.1,
+                        hallucination_reason="Supported by address evidence.",
+                    )
+
+                return Response()
+
+        ranked_chunks = [
+            {
+                "content": (
+                    "Sedi Lazio: Via Cornelia n. 498, 00166 Roma (RM). "
+                    "Campania: Via Benedetto Brin, 63/Piano 2, 80142 Napoli (NA)."
+                ),
+                "source": "studio81_riepilogo.pdf",
+                "domain_module": "contact",
+                "chunk_index": 0,
+                "relevance_score": 0.9,
+            }
+        ]
+
+        with patch("cag.agents.reasoning_agent.get_reasoning_agent", return_value=FakeAgent()):
+            output = run_reasoning_agent(
+                query="dove operate?",
+                ranked_chunks=ranked_chunks,
+                gaps=[],
+                response_language="it",
+            )
+
+        assert output.answer == answer
+        assert "Dettagli supportati" not in output.answer
+
+    def test_review_agent_removes_fragmented_duplicate_address_details(self):
+        from cag.agents.review_agent import run_review_agent
+
+        output = ReasoningOutput(
+            answer=(
+                "Studio 81 Data Systems opera in Italia con sedi a Roma, Lazio, "
+                "in Via Cornelia n. 498, e a Napoli, Campania, in Via Benedetto Brin 63/Piano 2.\n\n"
+                "Dettagli supportati:\n"
+                "- 498, 00166 Roma (RM) Campania: Via Benedetto Brin, 63/Piano 2 - 80142 Napoli (NA).\n"
+                "- Sedi Lazio: Via Cornelia n.\n"
+                "- Via Cornelia 498 - 00166 Roma (RM) Filiale: Via Benedetto Brin 63 - 80142 Napoli."
+            ),
+            query_type="GENERAL",
+            confidence=0.72,
+            citations=[],
+            hallucination_risk=0.1,
+            hallucination_reason="Supported by address evidence.",
+        )
+
+        reviewed = run_review_agent(
+            query="dove operate?",
+            output=output,
+            ranked_chunks=[],
+            gaps=[],
+            response_language="it",
+        )
+
+        assert reviewed.answer == (
+            "Studio 81 Data Systems opera in Italia con sedi a Roma, Lazio, "
+            "in Via Cornelia n. 498, e a Napoli, Campania, in Via Benedetto Brin 63/Piano 2."
+        )
+        assert "ReviewAgent" in reviewed.hallucination_reason
+
+
+class TestPostGroundingNode:
+    def test_marks_supported_answer_as_passed(self, base_state):
+        state = {
+            **base_state,
+            "answer": "The workflow requires an active project and an assigned owner.",
+            "confidence": 0.86,
+            "hallucination_risk": 0.08,
+            "ranked_chunks": [
+                {
+                    "content": "The workflow requires an active project and assigned owner.",
+                    "source": "workflow.txt",
+                    "relevance_score": 0.92,
+                }
+            ],
+            "node_trace": ["ENTRY", "RETRIEVE", "SELECT_CONTEXT", "REASON(retry=0)", "REVIEW"],
+        }
+
+        result = post_grounding_node(state)
+
+        assert result["post_grounding_status"] == "passed"
+        assert result["unsupported_claims"] == []
+        assert "POST_GROUNDING" in result["node_trace"]
+
+    def test_raises_risk_for_unsupported_answer(self, base_state):
+        state = {
+            **base_state,
+            "answer": "The vendor contract renews automatically every seven years.",
+            "confidence": 0.88,
+            "hallucination_risk": 0.05,
+            "ranked_chunks": [
+                {
+                    "content": "The workflow requires an active project and assigned owner.",
+                    "source": "workflow.txt",
+                    "relevance_score": 0.92,
+                }
+            ],
+            "node_trace": ["ENTRY", "RETRIEVE", "SELECT_CONTEXT", "REASON(retry=0)", "REVIEW"],
+        }
+
+        result = post_grounding_node(state)
+
+        assert result["post_grounding_status"] == "warn"
+        assert result["unsupported_claims"]
+        assert result["hallucination_risk"] >= 0.65
 
 
 class TestValidateNode:
@@ -309,9 +1014,11 @@ class TestValidateNode:
         }
         result = validate_node(state)
         assert result["should_escalate"] is False
-        assert result["should_retry_reason"] is True
+        assert result["should_retry_retrieval"] is True
         assert result["retry_guidance"]
-        assert len(result["ranked_chunks"]) <= 3
+        assert result["retrieval_retry_used"] is True
+        assert result["retrieval_top_k"] > base_state["retrieval_top_k"]
+        assert result["retrieval_strategy"] == "multi_evidence"
 
     def test_requests_adaptive_retry_for_low_confidence_before_max_retries(self, base_state):
         state = {
@@ -327,6 +1034,28 @@ class TestValidateNode:
                 {"content": "weaker", "relevance_score": 0.4},
             ],
             "reason_retries": 1,
+        }
+        result = validate_node(state)
+        assert result["should_escalate"] is False
+        assert result["should_retry_retrieval"] is True
+        assert result["retrieval_retry_used"] is True
+        assert "adaptive" in result["retry_guidance"].lower()
+
+    def test_requests_reason_retry_after_retrieval_retry_is_used(self, base_state):
+        state = {
+            **base_state,
+            "answer": "A narrow but uncertain answer.",
+            "hallucination_risk": 0.1,
+            "confidence": 0.2,
+            "relevance_score": 0.9,
+            "ranked_chunks": [
+                {"content": "strong 1", "relevance_score": 0.91},
+                {"content": "strong 2", "relevance_score": 0.84},
+                {"content": "strong 3", "relevance_score": 0.81},
+                {"content": "weaker", "relevance_score": 0.4},
+            ],
+            "reason_retries": 1,
+            "retrieval_retry_used": True,
         }
         result = validate_node(state)
         assert result["should_escalate"] is False
@@ -347,6 +1076,25 @@ class TestRouting:
         state = {**base_state, "relevance_score": 0.2, "ranked_chunks": []}
         assert route_after_select_context(state) == "validate"
 
+    def test_route_after_select_context_allows_document_profile_overview(self, base_state):
+        state = {
+            **base_state,
+            "query": "Ciao di cosa vi occupate?",
+            "query_type": "GENERAL",
+            "relevance_score": 0.3,
+            "ranked_chunks": [
+                {
+                    "content": "Company overview from the document profile.",
+                    "source": "company_overview.txt",
+                    "domain_module": "document_profile",
+                    "selection_category": "overview",
+                    "relevance_score": 0.32,
+                    "document_score": 2.4,
+                }
+            ],
+        }
+        assert route_after_select_context(state) == "reason"
+
     def test_route_after_validate_ok(self, base_state):
         state = {
             **base_state,
@@ -364,6 +1112,10 @@ class TestRouting:
     def test_route_after_validate_retry(self, base_state):
         state = {**base_state, "should_escalate": False, "should_retry_reason": True, "reason_retries": 1}
         assert route_after_validate(state) == "reason"
+
+    def test_route_after_validate_retrieval_retry(self, base_state):
+        state = {**base_state, "should_escalate": False, "should_retry_retrieval": True, "reason_retries": 1}
+        assert route_after_validate(state) == "retrieve"
 
 
 class TestExitNode:
@@ -434,6 +1186,21 @@ class TestIngestion:
         assert _extract_domain_module("manual_onboarding_workflow") == "onboarding"
         assert _extract_domain_module("guide_asset_register_policy") == "asset"
         assert _extract_domain_module("team_documentation") == "team"
+
+    def test_lexical_file_search_uses_local_documents_when_embeddings_are_unavailable(self, tmp_path):
+        from cag.ingestion.embedder import lexical_file_search
+
+        source_file = tmp_path / "nexus_overview.txt"
+        source_file.write_text(
+            "NexusFlow is a platform for support teams. "
+            "It helps teams triage incidents and coordinate customer communication.",
+            encoding="utf-8",
+        )
+
+        results = lexical_file_search("di cosa vi occupate?", k=1, data_dir=tmp_path)
+
+        assert len(results) == 1
+        assert "NexusFlow" in results[0].page_content
 
 
 class TestSelectionStructure:
