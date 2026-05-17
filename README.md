@@ -5,154 +5,91 @@
 ![Python](https://img.shields.io/badge/python-3.11+-blue)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
-**EN:** A safer RAG pipeline that selects evidence, validates answers, and refuses when docs are insufficient.  
-**IT:** Una pipeline RAG piu' sicura che seleziona evidenze, valida le risposte e rifiuta quando la documentazione non basta.
+A safer RAG pipeline that selects evidence, validates answers, and refuses when docs are insufficient.
 
-## EN - What Is CAG?
+## Language
+
+- [English](#english)
+- [Italiano](#italiano)
+
+## English
+
+### What Is CAG?
 
 CAG is a graph-driven document QA runtime for builders who need more control than plain `retrieve -> generate`.
 
 Core loop:
 
-`ENTRY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> VALIDATE -> EXIT`
+`ENTRY -> CONTEXTUALIZE_QUERY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> REVIEW -> POST_GROUNDING -> VALIDATE -> EXIT`
 
-Why it matters:
-- Query-type aware retrieval strategy.
-- Explicit context selection before generation.
-- Validation with confidence, hallucination risk, and escalation.
-- Better inspectability for benchmarking and debugging.
+### Core Idea
 
-## EN - Core Idea
+Grounding quality is mostly a retrieval-orchestration problem, not only a generation problem.
 
-The central idea behind CAG is simple and strict:
-
-`Grounding quality is mostly a retrieval-orchestration problem, not only a generation problem.`
-
-Most RAG failures happen before the final answer is written:
-- wrong retrieval strategy for the question type
-- redundant or weak context passed to the model
+Most RAG failures happen before final answer generation:
+- wrong retrieval strategy for the query type
+- redundant or weak context sent to the model
 - no explicit validation of evidence sufficiency
 
-CAG treats these as first-class architecture concerns.  
-Instead of just improving prompts, it improves the decision process that controls retrieval, context selection, and refusal/escalation.
+CAG treats these as first-class architecture concerns.
 
-## IT - Cos'e CAG?
+### Animated Overview (GIF)
 
-CAG e' un runtime di document QA guidato da grafo, pensato per chi vuole piu' controllo rispetto al classico `retrieve -> generate`.
+![CAG Flow Animation](docs/assets/cag-flow.gif)
 
-Loop principale:
+If the GIF is not visible yet, add `docs/assets/cag-flow.gif` to the repository.
 
-`ENTRY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> VALIDATE -> EXIT`
+### CAG Logic (Full Flow)
 
-Perche' e' utile:
-- Strategia di retrieval adattata al tipo di query.
-- Selezione esplicita del contesto prima della generazione.
-- Validazione con confidence, rischio allucinazione ed escalation.
-- Maggiore ispezionabilita' per benchmark e debug.
+#### 1. ENTRY
+- classify query type (`GENERAL`, `PROCEDURAL`, `DIAGNOSTIC`, `CONFIGURATION`)
+- infer scope (domain/consultative/personal)
+- detect response language
+- initialize retrieval strategy and plan
 
-## IT - Idea Centrale
+#### 2. CONTEXTUALIZE_QUERY
+- rewrite vague follow-ups using conversation history
+- preserve intent while adding retrieval anchors
 
-L'idea centrale di CAG e' semplice e rigorosa:
+#### 3. RETRIEVE
+- build query variants (rewrite + concept expansion)
+- search document profiles first (Document Map)
+- fallback to semantic retrieval when needed
+- optional lexical hybrid merge
+- dedupe/rerank with discriminative lexical scoring
 
-`La qualita' del grounding e' soprattutto un problema di orchestrazione del retrieval, non solo di generazione.`
+#### 4. SELECT_CONTEXT
+- rank for answerability, not only similarity
+- apply relevance/category/source diversity
+- keep compact context budgets
+- output ranked chunks and explicit gaps
 
-La maggior parte degli errori RAG nasce prima della risposta finale:
-- strategia di retrieval sbagliata per il tipo di domanda
-- contesto ridondante o debole passato al modello
-- assenza di validazione esplicita della sufficienza delle evidenze
+#### 5. REASON + REVIEW
+- generate from selected evidence only
+- output confidence, citations, hallucination risk
+- review pass tightens grounding language
 
-CAG tratta questi punti come scelte architetturali di primo livello.  
-Invece di migliorare solo i prompt, migliora il processo decisionale che governa retrieval, selezione contesto e refusal/escalation.
+#### 6. POST_GROUNDING
+- sentence-level support checks
+- detect unsupported claims
+- adjust confidence/risk when support is weak
 
-## EN - CAG Logic (Full Flow)
+#### 7. VALIDATE
+- route to one of:
+  - `EXIT`
+  - `REASON` retry
+  - `RETRIEVE` adaptive retry
+- escalate when evidence remains insufficient
 
-The runtime is a stateful graph with explicit decision points:
+#### 8. EXIT
+- return final answer or escalation message
+- attach diagnostics (`node_trace`, confidence, risk, fallback flags)
 
-`ENTRY -> CONTEXTUALIZE_QUERY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> REVIEW -> POST_GROUNDING -> VALIDATE -> EXIT`
+### ASCII Diagrams
 
-### 1. ENTRY
-- classifies query type (`GENERAL`, `PROCEDURAL`, `DIAGNOSTIC`, `CONFIGURATION`)
-- infers question scope (domain vs consultative vs personal)
-- detects response language
-- chooses retrieval strategy and initializes retrieval plan
-- resets runtime fields for a clean turn
-
-### 2. CONTEXTUALIZE_QUERY
-- checks conversation history
-- rewrites vague follow-ups into explicit retrieval-ready queries
-- preserves original intent while injecting context anchors from prior assistant answers
-
-### 3. RETRIEVE
-- builds query variants (rewrites + concept expansion)
-- queries document profiles first (Document Map)
-- if needed, falls back to global semantic retrieval
-- optionally merges hybrid lexical candidates
-- deduplicates and reranks chunks with discriminative lexical scoring
-
-### 4. SELECT_CONTEXT
-- ranks chunks for answerability, not only similarity
-- applies relevance/category/source diversity balancing
-- keeps a compact evidence set under context budget limits
-- produces ranked chunks + explicit gaps
-
-### 5. REASON + REVIEW
-- generates answer from selected evidence only
-- emits confidence, citations, hallucination risk
-- review pass tightens unsupported language and citation discipline
-
-### 6. POST_GROUNDING
-- sentence-level support checks against selected evidence
-- detects unsupported claims
-- adjusts confidence/risk when support is weak
-
-### 7. VALIDATE (Control Node)
-- decides one of three actions:
-  - `EXIT` with final answer
-  - `REASON` retry (narrower/safer generation)
-  - `RETRIEVE` adaptive retry (expanded query/strategy/top-k)
-- escalates when evidence is insufficient or risk remains high
-
-### 8. EXIT
-- returns final answer or escalation message
-- attaches diagnostics (`node_trace`, risk/confidence, fallback flags, actions)
-
-## EN - Decision Rules (Why It Refuses or Retries)
-
-CAG does not trust generation by default. It validates:
-- evidence sufficiency (`relevance_threshold`, moderate support checks)
-- confidence (`confidence_threshold`)
-- hallucination risk (`hallucination_threshold`)
-- unsupported-claim patterns in the produced answer
-
-If validation fails:
-- first try adaptive retrieval retry (if enabled and conditions match)
-- then try constrained reason retry
-- finally escalate instead of guessing
-
-## EN - Retrieval Design Details
-
-- Query typing drives strategy (`semantic`, `multi_evidence`, `hierarchical`)
-- Document Map is prioritized to reduce random top-k drift
-- Lexical discriminative scoring reduces redundant generic chunks
-- Hybrid lexical retrieval can be enabled for sparse semantic cases
-- Procedural flows can include neighboring chunks for sequence continuity
-
-## EN - Reasoning and Safety Contract
-
-The contract is:
-- answer only from evidence
-- cite what was used
-- state gaps explicitly
-- escalate when support is inadequate
-
-This makes CAG slower than naive RAG, but far more inspectable and safer for high-stakes document QA.
-
-## EN - ASCII Diagrams
-
-Full ASCII diagrams live here:
 - [CAG ASCII Flow](docs/cag-flow-ascii.md)
 
-Quick inline view:
+Quick view:
 
 ```text
 ENTRY -> CONTEXTUALIZE_QUERY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> REVIEW -> POST_GROUNDING -> VALIDATE -> EXIT
@@ -164,111 +101,7 @@ ENTRY -> CONTEXTUALIZE_QUERY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> REVIEW -
                                                            REASON RETRY
 ```
 
-## EN - Animated GIF Walkthroughs
-
-Add animated walkthroughs in `docs/assets/`:
-
-- `docs/assets/cag-flow.gif`
-- `docs/assets/cag-validate-routing.gif`
-- `docs/assets/cag-retrieval-ladder.gif`
-
-Embed examples:
-
-![CAG Full Flow](docs/assets/cag-flow.gif)
-![CAG Validate Routing](docs/assets/cag-validate-routing.gif)
-![CAG Retrieval Ladder](docs/assets/cag-retrieval-ladder.gif)
-
-## IT - Logica CAG (Flusso Completo)
-
-Il runtime e' un grafo stateful con punti decisionali espliciti:
-
-`ENTRY -> CONTEXTUALIZE_QUERY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> REVIEW -> POST_GROUNDING -> VALIDATE -> EXIT`
-
-### 1. ENTRY
-- classifica il tipo di query (`GENERAL`, `PROCEDURAL`, `DIAGNOSTIC`, `CONFIGURATION`)
-- identifica lo scope della domanda (domain/consultative/personal)
-- rileva la lingua di risposta
-- sceglie strategia retrieval e inizializza il piano
-- resetta i campi runtime del turno
-
-### 2. CONTEXTUALIZE_QUERY
-- usa la history conversazionale
-- riscrive follow-up vaghi in query piu' esplicite
-- mantiene intento originale aggiungendo anchor dal contesto precedente
-
-### 3. RETRIEVE
-- costruisce varianti query (rewrite + concept expansion)
-- interroga prima i document profile (Document Map)
-- se necessario, fallback su retrieval semantico globale
-- opzionalmente unisce candidati lexical hybrid
-- deduplica e reranka con scoring lessicale discriminativo
-
-### 4. SELECT_CONTEXT
-- ordina i chunk per answerability, non solo similarita'
-- bilancia rilevanza/diversita' categoria/diversita' fonte
-- mantiene un set evidenze compatto entro i limiti di budget
-- produce chunk ordinati + gap espliciti
-
-### 5. REASON + REVIEW
-- genera risposta solo dal contesto selezionato
-- emette confidence, citazioni, rischio allucinazione
-- passaggio review per stringere linguaggio non supportato
-
-### 6. POST_GROUNDING
-- controlli frase-per-frase contro le evidenze selezionate
-- rileva claim non supportati
-- aggiorna confidence/risk quando il supporto e' debole
-
-### 7. VALIDATE (Nodo di Controllo)
-- decide una delle tre azioni:
-  - `EXIT` con risposta finale
-  - retry `REASON` (generazione piu' stretta/sicura)
-  - retry `RETRIEVE` adattivo (query/strategia/top-k espansi)
-- scala quando evidenza e' insufficiente o rischio resta alto
-
-### 8. EXIT
-- restituisce risposta finale o messaggio di escalation
-- allega diagnostica (`node_trace`, risk/confidence, fallback, azioni)
-
-## IT - Regole Decisionali (Perche' Riprova o Escala)
-
-CAG non si fida della generazione in automatico. Valida:
-- sufficienza evidenze (`relevance_threshold` e supporti moderati)
-- confidence (`confidence_threshold`)
-- rischio allucinazione (`hallucination_threshold`)
-- pattern di claim non supportati nella risposta
-
-Se la validazione fallisce:
-- prima retry retrieval adattivo (se abilitato)
-- poi retry reason vincolato
-- infine escalation invece di indovinare
-
-## IT - Diagrammi ASCII
-
-I diagrammi ASCII completi sono qui:
-- [Flusso ASCII CAG](docs/cag-flow-ascii.md)
-
-Vista inline rapida:
-
-```text
-ENTRY -> CONTEXTUALIZE_QUERY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> REVIEW -> POST_GROUNDING -> VALIDATE -> EXIT
-                                              ^                                            |
-                                              |                                            |
-                                              +---------------- RETRIEVE RETRY <-----------+
-                                                                   ^
-                                                                   |
-                                                           REASON RETRY
-```
-
-## IT - GIF Animate (Walkthrough)
-
-Aggiungi GIF animate in `docs/assets/`:
-
-- `docs/assets/cag-flow.gif`
-- `docs/assets/cag-validate-routing.gif`
-- `docs/assets/cag-retrieval-ladder.gif`
-
-## EN - Start Here
+### Start Here
 
 - [Quickstart](docs/quickstart.md)
 - [API](docs/api.md)
@@ -287,7 +120,183 @@ pip install -e ".[dev,eval,api]"
 cag demo --reset --json
 ```
 
-## IT - Inizia Da Qui
+### 5 Minute Quickstart
+
+```bash
+python -m venv .venv
+.venv\Scripts\activate   # Windows
+pip install -e ".[dev,eval,api]"
+cag demo --reset --json
+```
+
+### STRICT_FAST Mode (Faster, Still Rigorous)
+
+```env
+STRICT_FAST_PROFILE=true
+```
+
+Speed-oriented overrides:
+- lower retrieval/context budgets
+- disables adaptive retrieval retry
+- disables hybrid lexical merge
+- keeps deterministic fast context path enabled
+
+Rigor remains:
+- `VALIDATE` stays active
+- confidence/hallucination thresholds still enforced
+- escalation still triggers when evidence is weak
+
+### Data Safety (Raw Documents)
+
+- `data/raw` is for local ingestion only.
+- do not commit private/source customer documents.
+- only publish sanitized public demo corpora.
+- never commit API keys or secrets.
+
+Current policy:
+- `.pdf/.txt/.md` in `data/raw` are ignored by `.gitignore`
+
+### Known Limits
+
+- benchmark coverage is still limited vs full production variability
+- CAG can be slower/costlier than simple RAG
+- retrieval gains can be dataset-sensitive
+- provider/model behavior can vary
+
+### 30-Day Roadmap
+
+1. publish updated multi-run benchmark snapshots
+2. improve retrieval diagnostics in public outputs
+3. strengthen release automation and benchmark gates
+4. expand onboarding docs/examples for contributors
+
+### Pre-Push Public Checklist
+
+1. rotate exposed keys and keep `.env` untracked
+2. verify no private raw docs are tracked
+3. run tests and benchmark smoke checks
+4. update benchmark snapshot in docs
+5. publish changelog/release notes with known limits
+
+### Repository Structure
+
+```text
+src/cag/
+  agents/
+  api/
+  eval/
+  graph/
+  ingestion/
+  retrieval/
+  knowledge/
+frontend/
+docs/
+tests/
+```
+
+### Community
+
+- [CONTRIBUTING.md](CONTRIBUTING.md)
+- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
+- [SECURITY.md](SECURITY.md)
+- [NOTICE](NOTICE)
+
+### Attribution Request
+
+CAG is MIT-licensed. If you use CAG publicly, attribution is appreciated:
+
+`Built with CAG by Fabio Scialanga`
+
+## Italiano
+
+### Cos'e CAG?
+
+CAG e' un runtime di document QA guidato da grafo, pensato per chi vuole piu' controllo rispetto al classico `retrieve -> generate`.
+
+Loop principale:
+
+`ENTRY -> CONTEXTUALIZE_QUERY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> REVIEW -> POST_GROUNDING -> VALIDATE -> EXIT`
+
+### Idea Centrale
+
+La qualita' del grounding e' soprattutto un problema di orchestrazione del retrieval, non solo di generazione.
+
+La maggior parte degli errori RAG nasce prima della risposta finale:
+- strategia retrieval sbagliata per il tipo di domanda
+- contesto ridondante o debole passato al modello
+- assenza di validazione esplicita della sufficienza delle evidenze
+
+CAG tratta questi aspetti come scelte architetturali di primo livello.
+
+### Panoramica Animata (GIF)
+
+![Animazione Flusso CAG](docs/assets/cag-flow.gif)
+
+Se la GIF non e' ancora visibile, aggiungi `docs/assets/cag-flow.gif` al repository.
+
+### Logica CAG (Flusso Completo)
+
+#### 1. ENTRY
+- classifica il tipo query (`GENERAL`, `PROCEDURAL`, `DIAGNOSTIC`, `CONFIGURATION`)
+- identifica lo scope (domain/consultative/personal)
+- rileva la lingua di risposta
+- inizializza strategia e piano retrieval
+
+#### 2. CONTEXTUALIZE_QUERY
+- riscrive follow-up vaghi usando la history
+- mantiene l'intento aggiungendo anchor utili al retrieval
+
+#### 3. RETRIEVE
+- costruisce varianti query (rewrite + concept expansion)
+- cerca prima nei document profile (Document Map)
+- fallback semantico globale quando necessario
+- merge lexical hybrid opzionale
+- dedupe/rerank con scoring lessicale discriminativo
+
+#### 4. SELECT_CONTEXT
+- ordina per answerability, non solo similarita'
+- bilancia rilevanza/diversita' categoria/diversita' fonte
+- mantiene budget contesto compatto
+- produce chunk ordinati e gap espliciti
+
+#### 5. REASON + REVIEW
+- genera solo dalle evidenze selezionate
+- emette confidence, citazioni, rischio allucinazione
+- review stringe il linguaggio non supportato
+
+#### 6. POST_GROUNDING
+- controlli frase-per-frase del supporto evidenze
+- rileva claim non supportati
+- aggiorna confidence/risk quando il supporto e' debole
+
+#### 7. VALIDATE
+- instrada verso:
+  - `EXIT`
+  - retry `REASON`
+  - retry adattivo `RETRIEVE`
+- scala quando l'evidenza resta insufficiente
+
+#### 8. EXIT
+- restituisce risposta finale o escalation
+- allega diagnostica (`node_trace`, confidence, risk, fallback)
+
+### Diagrammi ASCII
+
+- [Flusso ASCII CAG](docs/cag-flow-ascii.md)
+
+Vista rapida:
+
+```text
+ENTRY -> CONTEXTUALIZE_QUERY -> RETRIEVE -> SELECT_CONTEXT -> REASON -> REVIEW -> POST_GROUNDING -> VALIDATE -> EXIT
+                                              ^                                            |
+                                              |                                            |
+                                              +---------------- RETRIEVE RETRY <-----------+
+                                                                   ^
+                                                                   |
+                                                           REASON RETRY
+```
+
+### Inizia Da Qui
 
 - [Quickstart](docs/quickstart.md)
 - [API](docs/api.md)
@@ -306,7 +315,7 @@ pip install -e ".[dev,eval,api]"
 cag demo --reset --json
 ```
 
-## EN - 5 Minute Quickstart
+### Quickstart In 5 Minuti
 
 ```bash
 python -m venv .venv
@@ -315,258 +324,84 @@ pip install -e ".[dev,eval,api]"
 cag demo --reset --json
 ```
 
-Expected output: JSON answer with confidence, citations, escalation state, and node trace.
-
-## IT - Quickstart In 5 Minuti
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate   # Windows
-pip install -e ".[dev,eval,api]"
-cag demo --reset --json
-```
-
-Output atteso: risposta JSON con confidence, citazioni, stato escalation e node trace.
-
-## EN - Community-First Goals
-
-CAG is a public repository and aims to become a community reference project.
-
-Current priorities:
-- Reproducible benchmarks and transparent claims.
-- Small, frequent releases with clear changelog entries.
-- Strong onboarding and reliable local demo path.
-- Honest documentation of limits and tradeoffs.
-
-## IT - Obiettivi Community-First
-
-CAG e' un repository pubblico e punta a diventare un punto di riferimento per la community.
-
-Priorita' attuali:
-- Benchmark riproducibili e claim trasparenti.
-- Release piccole e frequenti con changelog chiaro.
-- Onboarding solido e demo locale affidabile.
-- Documentazione onesta di limiti e tradeoff.
-
-## EN - Data Safety (Raw Documents)
-
-- `data/raw` is for local ingestion only.
-- Source documents used for experiments should not be committed to Git.
-- Keep only sanitized demo corpora intended for public distribution.
-- Never commit API keys, secrets, customer data, or confidential files.
-
-Current repository policy:
-- raw `.pdf`, `.txt`, `.md` under `data/raw/` are ignored by `.gitignore`
-- benchmark corpus stays in `data/benchmark_corpus/`
-
-## IT - Sicurezza Dati (Documenti Raw)
-
-- `data/raw` e' solo per ingest locale.
-- I documenti sorgente usati negli esperimenti non vanno committati su Git.
-- Nel repository pubblico devono restare solo corpora demo sanitizzati.
-- Non committare mai API key, segreti, dati cliente o file confidenziali.
-
-Policy attuale del repository:
-- i file raw `.pdf`, `.txt`, `.md` in `data/raw/` sono ignorati da `.gitignore`
-- il corpus benchmark rimane in `data/benchmark_corpus/`
-
-## EN - Known Limits
-
-- Benchmark coverage is still limited compared to real production variability.
-- Cost and latency overhead are higher than simple RAG.
-- Some retrieval gains are dataset-sensitive and should be validated per domain.
-- Multi-provider behavior may vary due to model differences.
-
-## EN - STRICT_FAST Mode (Faster, Still Rigorous)
-
-If you need lower latency while preserving validation/escalation logic:
+### Modalita STRICT_FAST (Piu' Veloce, Ancora Rigorosa)
 
 ```env
 STRICT_FAST_PROFILE=true
 ```
 
-This profile automatically applies speed-oriented runtime caps:
-- lower retrieval/context budgets
-- disables adaptive retrieval retry
-- disables hybrid lexical merge
-- keeps fast deterministic context selection on
-
-What stays strict:
-- `VALIDATE` node still controls final routing
-- confidence and hallucination thresholds are still enforced
-- escalation still happens when evidence is insufficient
-
-## IT - Limiti Noti
-
-- La copertura benchmark e' ancora limitata rispetto alla variabilita' reale in produzione.
-- Costo e latenza sono piu' alti rispetto a RAG semplice.
-- Alcuni miglioramenti di retrieval sono sensibili al dataset e vanno validati per dominio.
-- Il comportamento multi-provider puo' variare per differenze tra modelli.
-
-## IT - Modalita STRICT_FAST (Piu' Veloce, Ancora Rigorosa)
-
-Se vuoi ridurre la latenza mantenendo validazione/escalation:
-
-```env
-STRICT_FAST_PROFILE=true
-```
-
-Questo profilo applica automaticamente override orientati alla velocita':
+Override orientati alla velocita':
 - budget retrieval/context piu' bassi
 - disattiva adaptive retrieval retry
 - disattiva merge lexical hybrid
-- mantiene attiva la context selection deterministica veloce
+- mantiene attiva la fast context selection deterministica
 
-Cosa resta rigoroso:
-- il nodo `VALIDATE` continua a controllare il routing finale
-- le soglie di confidence/hallucination restano attive
-- l'escalation resta attiva quando l'evidenza non basta
+La rigorosita' resta:
+- `VALIDATE` rimane attivo
+- soglie confidence/hallucination restano attive
+- escalation resta attiva con evidenza debole
 
-## EN - 30-Day Roadmap
+### Sicurezza Dati (Documenti Raw)
 
-1. Publish updated triplet benchmark snapshot after hybrid retrieval changes.
-2. Add retrieval diagnostics to public outputs with clearer score explanations.
-3. Strengthen release automation (benchmark artifact checks + release checklist).
-4. Expand docs/examples for contributor onboarding and reproducibility.
+- `data/raw` e' solo per ingest locale
+- non committare documenti privati o cliente
+- pubblicare solo corpora demo sanitizzati
+- non committare mai API key o segreti
 
-## IT - Roadmap 30 Giorni
+Policy attuale:
+- i file `.pdf/.txt/.md` in `data/raw` sono ignorati da `.gitignore`
 
-1. Pubblicare snapshot benchmark triplet aggiornato dopo i cambi hybrid retrieval.
-2. Aggiungere diagnostica retrieval negli output pubblici con spiegazioni score piu' chiare.
-3. Rafforzare automazione release (controlli artifact benchmark + checklist release).
-4. Espandere docs/esempi per onboarding contributor e riproducibilita'.
+### Limiti Noti
 
-## EN - Pre-Push Public Checklist
+- copertura benchmark ancora limitata rispetto alla variabilita' reale
+- CAG puo' essere piu' lento/costoso di RAG semplice
+- i guadagni retrieval possono dipendere dal dataset
+- il comportamento puo' variare tra provider/modelli
 
-1. Rotate any exposed API keys and verify `.env` is never committed.
-2. Confirm `data/raw` contains no tracked private documents.
-3. Run tests and benchmark smoke checks.
-4. Update benchmark snapshot in docs with date and command.
-5. Publish changelog/release notes with known limits.
+### Roadmap 30 Giorni
 
-## IT - Checklist Pre-Push Pubblico
+1. pubblicare snapshot benchmark multi-run aggiornati
+2. migliorare diagnostica retrieval negli output pubblici
+3. rafforzare release automation e benchmark gates
+4. espandere docs/esempi onboarding contributor
 
-1. Ruota eventuali API key esposte e verifica che `.env` non venga mai committato.
-2. Conferma che in `data/raw` non ci siano documenti privati tracciati.
-3. Esegui test e benchmark smoke.
-4. Aggiorna snapshot benchmark nelle docs con data e comando.
-5. Pubblica changelog/release notes con limiti noti.
+### Checklist Pre-Push Pubblico
 
-## EN - RAG vs CAG (Short)
+1. ruotare chiavi esposte e tenere `.env` non tracciato
+2. verificare che non ci siano raw docs privati tracciati
+3. eseguire test e benchmark smoke
+4. aggiornare snapshot benchmark nelle docs
+5. pubblicare changelog/release notes con limiti noti
 
-Standard RAG:
-
-`question -> retrieve -> generate -> answer`
-
-CAG:
-
-`question -> classify -> retrieve -> select context -> reason -> validate -> answer/retry/escalate`
-
-## IT - RAG vs CAG (Breve)
-
-RAG standard:
-
-`domanda -> retrieve -> generate -> risposta`
-
-CAG:
-
-`domanda -> classify -> retrieve -> select context -> reason -> validate -> risposta/retry/escalation`
-
-## EN - Local Validation Flow
-
-```bash
-pip install -e ".[dev,eval,api]"
-pytest
-cag eval --system cag --limit 3 --judge-mode off
-python -m uvicorn cag.api.upload:app --reload --port 8000
-```
-
-Optional frontend:
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-## IT - Flusso Di Validazione Locale
-
-```bash
-pip install -e ".[dev,eval,api]"
-pytest
-cag eval --system cag --limit 3 --judge-mode off
-python -m uvicorn cag.api.upload:app --reload --port 8000
-```
-
-Frontend opzionale:
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-## EN - Repository Structure
+### Struttura Repository
 
 ```text
 src/cag/
-  agents/        # Retrieval + reasoning agents
-  api/           # FastAPI upload/query endpoints
-  eval/          # Benchmarks, scoring, comparisons
-  graph/         # Nodes, state, routing
-  ingestion/     # Loader, chunker, embeddings, vector store
-  retrieval/     # Lexical scoring and context dedupe
-  knowledge/     # DB-first compiled knowledge layer
-frontend/        # React preview UI
-docs/            # Project docs
-tests/           # Unit and integration tests
+  agents/
+  api/
+  eval/
+  graph/
+  ingestion/
+  retrieval/
+  knowledge/
+frontend/
+docs/
+tests/
 ```
 
-## IT - Struttura Del Repository
-
-```text
-src/cag/
-  agents/        # Agenti retrieval + reasoning
-  api/           # Endpoint FastAPI upload/query
-  eval/          # Benchmark, scoring, confronti
-  graph/         # Nodi, stato, routing
-  ingestion/     # Loader, chunker, embedding, vector store
-  retrieval/     # Scoring lessicale e dedupe contesto
-  knowledge/     # Layer DB-first di knowledge compilata
-frontend/        # UI React di anteprima
-docs/            # Documentazione progetto
-tests/           # Test unitari e integrazione
-```
-
-## EN - Community
+### Community
 
 - [CONTRIBUTING.md](CONTRIBUTING.md)
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
 - [SECURITY.md](SECURITY.md)
 - [NOTICE](NOTICE)
 
-## IT - Community
+### Richiesta Di Attribuzione
 
-- [CONTRIBUTING.md](CONTRIBUTING.md)
-- [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md)
-- [SECURITY.md](SECURITY.md)
-- [NOTICE](NOTICE)
-
-## EN - Attribution Request
-
-CAG is released under MIT.  
-If you use CAG publicly, attribution is appreciated:
-
-`Built with CAG by Fabio Scialanga`
-
-## IT - Richiesta Di Attribuzione
-
-CAG e' rilasciato con licenza MIT.  
-Se usi CAG in pubblico, l'attribuzione e' apprezzata:
+CAG e' rilasciato con licenza MIT. Se usi CAG in pubblico, l'attribuzione e' apprezzata:
 
 `Built with CAG by Fabio Scialanga`
 
 ## License
 
 [MIT](LICENSE)
-
